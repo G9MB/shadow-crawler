@@ -6,8 +6,8 @@ import re
 import random
 
 # ⚠️ [필수 수정] 본인의 정보로 채워 넣으세요!
-TOKEN = os.environ.get('8461694962:AAG8A1pjQ5CGvmVPdP51LuVGQFI_JSLK_AI')
-CHAT_ID = os.environ.get('839306219')
+TOKEN = os.environ.get('TELEGRAM_TOKKEN')
+CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 sent_posts = set()
 
 def send_telegram_message(text):
