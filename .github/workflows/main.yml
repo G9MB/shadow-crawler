@@ -1,6 +1,7 @@
 name: Ppomppu Coupon Sniper
 
 on:
+  workflow_dispatch:
   schedule:
     # 🎯 한국 시간 기준 아침 7시 ~ 밤 12시(24시)까지만 0분, 30분에 실행합니다.
     # (UTC 기준 0시~15시, 그리고 22시, 23시 지정으로 한국 새벽 시간대 완벽 차단)
