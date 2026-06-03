@@ -5,12 +5,28 @@ import time
 import re
 import random
 
-# ⚠️ [필수 수정] 본인의 정보로 채워 넣으세요!
-TOKEN = os.environ.get('TELEGRAM_TOKKEN')
+# 🎯 환경변수 이름 일치 (대소문자 및 철자 수정)
+TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
-sent_posts = set()
+
+DB_FILE = "sent_posts.txt"
+
+def load_sent_posts():
+    """파일에서 이미 발송한 게시글 제목 목록을 읽어옵니다."""
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            return set(line.strip() for line in f if line.strip())
+    return set()
+
+def save_sent_post(title):
+    """새로 발송한 게시글 제목을 파일에 기록합니다."""
+    with open(DB_FILE, "a", encoding="utf-8") as f:
+        f.write(title + "\n")
 
 def send_telegram_message(text):
+    if not TOKEN or not CHAT_ID:
+        print("❌ 텔레그램 토큰 또는 CHAT_ID가 설정되지 않았습니다.")
+        return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {'chat_id': CHAT_ID, 'text': text}
     try:
@@ -19,51 +35,44 @@ def send_telegram_message(text):
         print(f"❌ 텔레그램 발송 에러: {e}")
 
 def get_detail_content(post_url):
-    """실제 뽐뿌 상세 페이지의 태그를 추적하여 본문과 댓글을 파싱"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
-    
     try:
         response = requests.get(post_url, headers=headers)
         if response.status_code != 200:
             return "본문 페이지 접속 실패", []
             
         soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # 1. [보정] 모바일 뽐뿌 실제 본문 컨텐츠 영역 감지 (.pic_bg 또는 .board-contents 등)
         content_div = soup.select_one('.board-contents, .pic_bg, .bbs_view_content, .cont')
         
-        # 만약 특정 클래스가 안 잡히면 본문 글을 담는 상위 div 구조를 직접 추적
         if not content_div:
             content_div = soup.select_one('#mainContent')
             
         content_text = content_div.get_text().strip() if content_div else "본문 내용을 파싱할 수 없는 구조입니다."
-        
-        # 광고 및 불필요한 공백 정제
         content_text = re.sub(r'\n+', '\n', content_text)
         if len(content_text) > 250:
             content_text = content_text[:250] + "...(지면상 생략)"
             
-        # 2. [보정] 모바일 뽐뿌 실제 댓글 내역 추적 (.comment_text 또는 .comment_memo)
         comment_elements = soup.select('.comment_memo, .comment_text, .comment-content, div[class*="comment_"]')
         comments = []
         for i, reply in enumerate(comment_elements):
             if i >= 5: 
                 break
             reply_text = reply.get_text().strip()
-            # 작성자 아이디나 날짜 등이 섞여서 지저분하게 나오는 것 방지
             reply_text = re.sub(r'\s+', ' ', reply_text)
             if reply_text and len(reply_text) > 1:
                 comments.append(f"- {reply_text}")
                 
         return content_text, comments
-        
     except Exception as e:
         print(f"❌ 상세 페이지 분석 에러: {e}")
         return "본문 로딩 실패", []
 
 def check_ppomppu_coupon():
+    # 실행할 때마다 저장된 파일에서 기존 발송 목록을 불러옵니다.
+    sent_posts = load_sent_posts()
+    
     url = "https://m.ppomppu.co.kr/new/bbs_list.php?id=coupon&extref=1"
     headers = {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -84,25 +93,20 @@ def check_ppomppu_coupon():
         print(f"🔄 현재 시간 {time.strftime('%Y-%m-%d %H:%M:%S')} - 게시글 {len(titles)}개 스캔 중...")
         
         for item in titles:
-            # 1. 태그 안의 raw 텍스트를 가져옵니다.
             raw_text = item.get_text().strip()
             if not raw_text:
                 continue
                 
-            # 2. [핵심 보정] 엔터(\n)나 탭 문자를 기준으로 쪼개서 맨 첫 줄(진짜 제목)만 가져옵니다.
-            # 뽐뿌 모바일은 제목 뒤의 시간, 조회수 등을 엔터나 공백으로 구분해 둡니다.
             lines = [line.strip() for line in raw_text.split('\n') if line.strip()]
             if not lines:
                 continue
-            title_text = lines[0] # 첫 번째 줄이 무조건 진짜 제목입니다.
-            
-            # 3. 간혹 한 줄로 붙어 나오는 지저분한 여백이나 마무리를 깔끔하게 정리
+            title_text = lines[0]
             title_text = re.sub(r'\s+', ' ', title_text)
             
             if not title_text or len(title_text) < 3:
                 continue
                 
-            # 설정한 핵심 키워드 감시 조건 (예: '쿠폰' 또는 '네이버페이')
+            # 복합 조건 필터링 (토스+퀴즈 OR 네이버+180)
             if ("토스" in title_text and "퀴즈" in title_text) or ("네이버" in title_text and "180" in title_text):
                 
                 if title_text in sent_posts:
@@ -131,22 +135,29 @@ def check_ppomppu_coupon():
                 )
                 
                 send_telegram_message(alert_msg)
-                sent_posts.add(title_text)
+                save_sent_post(title_text)  # 🎯 중복 차단을 위해 영구 파일에 저장
                 time.sleep(1.5)
                 
     except Exception as e:
         print(f"❌ 크롤링 중 에러 발생: {e}")
 
+# 🎯 무한 루프 없이 깃허브가 깨워주면 25~45초 간격으로 '딱 6번' 스캔하고 종료
 if __name__ == "__main__":
-    print("🕵️‍♂️ [Shadow_crawler_bot] 상시 감시 모드를 가동합니다.")
+    print("🚀 [GitHub Actions] 정각/30분 트리거 발동. 6회 집중 정찰을 시작합니다.")
     
-    while True:
+    # 1부터 6까지 정확히 6번 반복 실행하도록 변경
+    for attempt in range(1, 7):
+        print(f"🕵️‍♂️ [{attempt}/6 번째 정찰 수행 중...]")
         check_ppomppu_coupon()
         
-        # 🎯 [변경 포인트] 30초 고정이 아니라, 지정한 범위 내에서 랜덤하게 초를 선택합니다.
-        # 예: 20초에서 45초 사이의 정수를 무작위로 추출
-        sleep_time = random.randint(20, 45)
+        # 6번째 마지막 크롤링을 마쳤다면 더 이상 대기할 필요가 없으므로 루프 탈출
+        if attempt == 6:
+            break
+            
+        # 🎯 [변경 포인트] 다음 스캔까지 25초에서 45초 사이의 무작위 초 선택
+        next_sleep = random.randint(25, 45)
+        print(f"⏳ 보안 우회 및 밀착 감시를 위해 {next_sleep}초 대기 후 다음 스캔...")
+        time.sleep(next_sleep)
         
-        print(f"💤 보안을 위해 {sleep_time}초 동안 무작위 대기 후 다시 정찰합니다...\n")
-        time.sleep(sleep_time)
+    print("✅ 6회 집중 밀착 정찰 완료. 가상 서버를 안전하게 종료합니다.")
 
