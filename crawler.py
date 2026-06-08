@@ -108,8 +108,8 @@ def check_ppomppu_coupon():
             if not title_text or len(title_text) < 3:
                 continue
                 
-            # 복합 조건 필터링 (토스+퀴즈 OR 네이버+180)
-            if ("토스" in title_text and "퀴즈" in title_text) or ("네이버" in title_text and "180" in title_text):
+            # 복합 조건 필터링 (토스 OR 네이버+180)
+            if (("토스" in title_text) and not ("토스트" in title_text or "팀플" in title_text)) or ("네이버" in title_text and "180" in title_text):
                 
                 if title_text in sent_posts:
                     continue
@@ -128,13 +128,20 @@ def check_ppomppu_coupon():
                 content, comments_list = get_detail_content(post_url)
                 comments_str = "\n".join(comments_list) if comments_list else "등록된 댓글이 없습니다."
                 
+                # 기존 alert_msg 윗부분에 아래 로직 추가
+                if "토스" in title_text:
+                    category = "🚨 토스 퀴즈!"
+                else:
+                    category = "💚 네이버 페이!"
+
                 alert_msg = (
-                    f"🚨 [Shadow_crawler_bot] 조건 발견!\n\n"
+                    f"{category}\n\n"  # 고정 문구 대신 변수 적용
                     f"📌 제목: {title_text}\n"
                     f"🔗 링크: {post_url}\n\n"
                     f"📝 [글 내용]\n{content}\n\n"
                     f"💬 [최신 댓글 요약]\n{comments_str}"
                 )
+
                 
                 send_telegram_message(alert_msg)
                 save_sent_post(title_text)  # 🎯 중복 차단을 위해 영구 파일에 저장
@@ -143,23 +150,23 @@ def check_ppomppu_coupon():
     except Exception as e:
         print(f"❌ 크롤링 중 에러 발생: {e}")
 
-# 🎯 무한 루프 없이 깃허브가 깨워주면 25~45초 간격으로 '딱 6번' 스캔하고 종료
+# 🎯 무한 루프 없이 깃허브가 깨워주면 30~45초 간격으로 '딱 7번' 스캔하고 종료
 if __name__ == "__main__":
-    print("🚀 [GitHub Actions] 정각/30분 트리거 발동. 6회 집중 정찰을 시작합니다.")
+    print("🚀 [GitHub Actions] 정각/30분 트리거 발동. 7회 집중 정찰을 시작합니다.")
     
-    # 1부터 6까지 정확히 6번 반복 실행하도록 변경
-    for attempt in range(1, 7):
-        print(f"🕵️‍♂️ [{attempt}/6 번째 정찰 수행 중...]")
+    # 1부터 7까지 정확히 7번 반복 실행하도록 변경
+    for attempt in range(1, 8):
+        print(f"🕵️‍♂️ [{attempt}/7 번째 정찰 수행 중...]")
         check_ppomppu_coupon()
         
-        # 6번째 마지막 크롤링을 마쳤다면 더 이상 대기할 필요가 없으므로 루프 탈출
-        if attempt == 6:
+        # 7번째 마지막 크롤링을 마쳤다면 더 이상 대기할 필요가 없으므로 루프 탈출
+        if attempt == 7:
             break
             
-        # 🎯 [변경 포인트] 다음 스캔까지 25초에서 45초 사이의 무작위 초 선택
-        next_sleep = random.randint(25, 45)
+        # 🎯 [변경 포인트] 다음 스캔까지 30초에서 45초 사이의 무작위 초 선택
+        next_sleep = random.randint(30, 45)
         print(f"⏳ 보안 우회 및 밀착 감시를 위해 {next_sleep}초 대기 후 다음 스캔...")
         time.sleep(next_sleep)
         
-    print("✅ 6회 집중 밀착 정찰 완료. 가상 서버를 안전하게 종료합니다.")
+    print("✅ 7회 집중 밀착 정찰 완료. 가상 서버를 안전하게 종료합니다.")
 
