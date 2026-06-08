@@ -172,7 +172,7 @@ def check_ppomppu_coupon():
                 # 2. 댓글 요약을 바로 밑에 바짝 붙여서 배너 영역 안으로 끌어올림
                 if comments_list:
                     # 댓글들을 줄바꿈(\n)으로 이어 붙이되, 배너 공간을 위해 앞에 붙던 빈 줄 제거
-                    alert_msg += f"💬 댓글:\n{comments_str}\n"
+                    alert_msg += f"💬 댓글:{comments_str}\n"
                 else:
                     alert_msg += "💬 댓글: 등록된 댓글이 없습니다.\n"
 
