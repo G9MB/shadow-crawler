@@ -152,21 +152,21 @@ def check_ppomppu_coupon():
 
 # 🎯 무한 루프 없이 깃허브가 깨워주면 30~45초 간격으로 '딱 7번' 스캔하고 종료
 if __name__ == "__main__":
-    print("🚀 [GitHub Actions] 정각/30분 트리거 발동. 7회 집중 정찰을 시작합니다.")
+    print("🚀 [GitHub Actions] 정각/30분 트리거 발동. 8회 집중 정찰을 시작합니다.")
     
-    # 1부터 7까지 정확히 7번 반복 실행하도록 변경
-    for attempt in range(1, 8):
+    # 1부터 8까지 정확히 8번 반복 실행하도록 변경
+    for attempt in range(1, 9):
         print(f"🕵️‍♂️ [{attempt}/7 번째 정찰 수행 중...]")
         check_ppomppu_coupon()
         
-        # 7번째 마지막 크롤링을 마쳤다면 더 이상 대기할 필요가 없으므로 루프 탈출
-        if attempt == 7:
+        # 8번째 마지막 크롤링을 마쳤다면 더 이상 대기할 필요가 없으므로 루프 탈출
+        if attempt == 8:
             break
             
-        # 🎯 [변경 포인트] 다음 스캔까지 30초에서 45초 사이의 무작위 초 선택
-        next_sleep = random.randint(30, 45)
+        # 🎯 [변경 포인트] 다음 스캔까지 25초에서 40초 사이의 무작위 초 선택
+        next_sleep = random.randint(25, 40)
         print(f"⏳ 보안 우회 및 밀착 감시를 위해 {next_sleep}초 대기 후 다음 스캔...")
         time.sleep(next_sleep)
         
-    print("✅ 7회 집중 밀착 정찰 완료. 가상 서버를 안전하게 종료합니다.")
+    print("✅ 8회 집중 밀착 정찰 완료. 가상 서버를 안전하게 종료합니다.")
 
