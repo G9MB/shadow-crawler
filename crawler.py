@@ -150,21 +150,21 @@ def check_ppomppu_coupon():
     except Exception as e:
         print(f"❌ 크롤링 중 에러 발생: {e}")
 
-# 🎯 무한 루프 없이 깃허브가 깨워주면 30~45초 간격으로 '딱 7번' 스캔하고 종료
+# 🎯 무한 루프 없이 깃허브가 깨워주면 25~35초 간격으로 '딱 8번' 스캔하고 종료
 if __name__ == "__main__":
     print("🚀 [GitHub Actions] 정각/30분 트리거 발동. 8회 집중 정찰을 시작합니다.")
     
     # 1부터 8까지 정확히 8번 반복 실행하도록 변경
     for attempt in range(1, 9):
-        print(f"🕵️‍♂️ [{attempt}/7 번째 정찰 수행 중...]")
+        print(f"🕵️‍♂️ [{attempt}/8 번째 정찰 수행 중...]")
         check_ppomppu_coupon()
         
         # 8번째 마지막 크롤링을 마쳤다면 더 이상 대기할 필요가 없으므로 루프 탈출
         if attempt == 8:
             break
             
-        # 🎯 [변경 포인트] 다음 스캔까지 25초에서 40초 사이의 무작위 초 선택
-        next_sleep = random.randint(25, 40)
+        # 🎯 [변경 포인트] 다음 스캔까지 25초에서 35초 사이의 무작위 초 선택
+        next_sleep = random.randint(25, 35)
         print(f"⏳ 보안 우회 및 밀착 감시를 위해 {next_sleep}초 대기 후 다음 스캔...")
         time.sleep(next_sleep)
         
