@@ -130,7 +130,7 @@ def check_ppomppu_coupon():
             if (
                 ("토스" in title_text)
                 and not ("토스트" in title_text or "팀플" in title_text)
-            ) or ("네이버" in title_text and "180" in title_text):
+            ) or (("네이버" in title_text) and ("180" in title_text or "100" in title_text)):
 
                 if title_text in sent_posts:
                     continue
