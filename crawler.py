@@ -159,13 +159,13 @@ def check_ppomppu_coupon():
 
                 # 기존 alert_msg 윗부분에 아래 로직 추가
                 if "토스" in title_text:
-                    category = f"🚨 토스 퀴즈"
+                    category = "🚨"
                 else:
-                    category = "💚 네이버 페이"
+                    category = "💚"
 
                 # 1. 팝업 배너에서 바로 보일 상단부 (링크와 불필요한 빈 줄을 없앰)
                 alert_msg = (
-                    f"{category} | {title_text}\n"  # 첫 줄: 카테고리와 제목 결합
+                    f"{category}{title_text}\n"  # 첫 줄: 카테고리와 제목 결합
                     f"📄 본문: {content.strip()[:100]}\n"  # 둘째 줄: 본문 핵심 100자
                 )
 
