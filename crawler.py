@@ -9,6 +9,7 @@ import re
 import random
 import logging
 from logging.handlers import TimedRotatingFileHandler
+import json
 from datetime import datetime
 
 # ================================================================= #
@@ -16,21 +17,21 @@ from datetime import datetime
 # ================================================================= #
 # 1. 토스 관련 키워드 (포함할 단어 / 제외할 단어)
 INCLUDE_TOSS = ["토스"]
-EXCLUDE_TOSS = ["토스트", "팀플"]
+EXCLUDE_TOSS = ["토스트", "알바"]
 
 # 2. 네이버 페이 관련 키워드 (기본 포함 단어 / 매칭될 필수 단어)
 INCLUDE_NAVER = ["네이버"]
 MATCH_NAVER = ["180", "100"]
 
-# 3. 댓글에서 제외할 단순 인사성 단어 목록
-EXCLUDE_COMMENTS = ["감사", "고맙", "추천", "ㅊㅊ", "ㄱㅅ"]
+# 3. 필터링할 댓글 제외 단어 목록
+EXCLUDE_COMMENTS = ["감사", "고맙", "추천", "ㅊㅊ", "ㄱㅅ", "종료"]
 
 # 4. 파일 경로 설정 (크론탭 환경 대응 절대 경로)
 LOG_FILE_PATH = "/home/swkim/shadow-crawler/crawler.log"
 DB_FILE = "/home/swkim/shadow-crawler/sent_posts.txt"
 # ================================================================= #
 
-# 로그 시스템 설정 (하루 단위 로테이션 및 자정 자동 파기)
+# 로그 시스템 설정
 logger = logging.getLogger("CrawlerLogger")
 logger.setLevel(logging.INFO)
 
@@ -53,29 +54,25 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 
 def load_sent_posts():
-    """파일에서 {글번호: 최초발송시간} 구조의 딕셔너리를 읽어옵니다."""
-    sent_dict = {}
+    """파일에서 {글번호: {"time": "시간", "comments": [...]}} 구조를 읽어옵니다."""
     if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or "," not in line:
-                    continue
-                time_str, post_no = line.split(",", 1)
-                try:
-                    sent_dict[post_no] = datetime.strptime(
-                        time_str, "%Y-%m-%d %H:%M:%S"
-                    )
-                except ValueError:
-                    continue
-    return sent_dict
+        try:
+            with open(DB_FILE, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    return json.loads(content)
+        except Exception as e:
+            logger.error(f"❌ DB 파일 읽기 실패 (새로 생성합니다): {e}")
+    return {}
 
 
-def save_sent_post(post_no):
-    """새로 발송한 게시글의 글 번호를 현재 시간과 함께 파일에 기록합니다."""
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(DB_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{now_str},{post_no}\n")
+def save_all_posts(posts_dict):
+    """전체 데이터 딕셔너리를 JSON 형태로 파일에 저장합니다."""
+    try:
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(posts_dict, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"❌ DB 파일 저장 실패: {e}")
 
 
 def send_telegram_message(text):
@@ -122,17 +119,12 @@ def get_detail_content(post_url):
         comments = []
 
         for reply in comment_elements:
-            if len(comments) >= 5:
+            if len(comments) >= 10:
                 break
-
             reply_text = reply.get_text().strip()
             reply_text = re.sub(r"\s+", " ", reply_text)
-
             if reply_text and len(reply_text) > 1:
-                # 🎯 상단에 정의한 EXCLUDE_COMMENTS 리스트 조건 대조 및 필터링
-                if any(keyword in reply_text for keyword in EXCLUDE_COMMENTS):
-                    continue
-                comments.append(f"- {reply_text}")
+                comments.append(reply_text)
 
         return content_text, comments
     except Exception as e:
@@ -141,7 +133,9 @@ def get_detail_content(post_url):
 
 
 def check_ppomppu_coupon():
+    # 데이터 구조: { "글번호": {"time": "2026-06-11 21:00:00", "comments": ["댓1", "댓2"]} }
     sent_posts = load_sent_posts()
+    db_updated = False
 
     url = "https://m.ppomppu.co.kr/new/bbs_list.php?id=coupon&extref=1"
     headers = {
@@ -191,7 +185,7 @@ def check_ppomppu_coupon():
                 f"https://m.ppomppu.co.kr/new/bbs_view.php?id=coupon&no={post_no}"
             )
 
-            # 🎯 any() 문법을 적용하여 축약된 대괄호 리스트 키워드 필터링
+            # [조건 1] 제목 키워드 검사
             is_toss_valid = any(w in title_text for w in INCLUDE_TOSS) and not any(
                 w in title_text for w in EXCLUDE_TOSS
             )
@@ -201,40 +195,110 @@ def check_ppomppu_coupon():
 
             if is_toss_valid or is_naver_valid:
 
-                # 🎯 최초 발송 기록 대조 및 20분(1200초) 타임아웃 락 검사
-                if post_no in sent_posts:
-                    first_sent_time = sent_posts[post_no]
+                is_first_time = post_no not in sent_posts
+
+                # 🎯 [추가] 20분 시간 타임아웃 락 검사
+                if not is_first_time:
+                    first_sent_time_str = sent_posts[post_no]["time"]
+                    first_sent_time = datetime.strptime(
+                        first_sent_time_str, "%Y-%m-%d %H:%M:%S"
+                    )
                     time_passed = datetime.now() - first_sent_time
 
+                    # 최초 발송 후 20분(1200초)이 경과했다면 댓글 변화조차 체크하지 않고 무조건 제외
                     if time_passed.total_seconds() > 1200:
                         continue
 
-                content, comments_list = get_detail_content(post_url)
-                comments_str = (
-                    "\n".join(comments_list)
-                    if comments_list
-                    else "등록된 댓글이 없습니다."
-                )
+                # 본문 및 최신 댓글 수집
+                content, current_comments = get_detail_content(post_url)
 
-                category = "🚨 " if is_toss_valid else "💚 "
+                should_send = False
 
-                # 팝업 배너 최적화 메시지 생성
-                alert_msg = (
-                    f"{category}{title_text}\n" f"📄 본문: {content.strip()[:100]}\n"
-                )
-
-                if comments_list:
-                    alert_msg += f"💬 댓글요약:\n{comments_str}\n"
+                if is_first_time:
+                    # [조건 1] 최초 글 발견 시 무조건 알림 승인
+                    should_send = True
+                    display_comments = current_comments[:5]
                 else:
-                    alert_msg += "💬 댓글: 등록된 댓글이 없습니다.\n"
+                    # 재방문인 경우 (20분 이내 내부 변화 추적)
+                    old_comments = sent_posts[post_no]["comments"]
 
-                alert_msg += f"🔗 링크: {post_url}"
+                    # [조건 3] 새로 추가된 댓글만 필터링
+                    new_comments = [
+                        c for c in current_comments if c not in old_comments
+                    ]
 
-                send_telegram_message(alert_msg)
+                    if not new_comments:
+                        # [조건 2] 추가된 댓글이 없다면 알림 제외
+                        continue
 
-                # 중복 및 20분 검사용 고유 글 번호 저장
-                save_sent_post(post_no)
-                time.sleep(1.5)
+                    # [조건 4] 추가된 댓글 전부가 제외 단어인 경우 알림 자체를 제외
+                    all_new_are_exclude = all(
+                        any(k in nc for k in EXCLUDE_COMMENTS) for nc in new_comments
+                    )
+                    if all_new_are_exclude:
+                        # 파일 내부의 댓글 데이터만 최신화하고 알림은 스킵
+                        sent_posts[post_no]["comments"] = current_comments
+                        db_updated = True
+                        continue
+
+                    # [조건 5] 감사 댓글은 빼고 실질적인 정보성 새 댓글만 추출
+                    valid_new_comments = [
+                        nc
+                        for nc in new_comments
+                        if not any(k in nc for k in EXCLUDE_COMMENTS)
+                    ]
+
+                    if valid_new_comments:
+                        should_send = True
+                        display_comments = valid_new_comments[:5]
+                    else:
+                        # 필터링 후 남은 새 댓글이 없다면 알림 제외
+                        sent_posts[post_no]["comments"] = current_comments
+                        db_updated = True
+                        continue
+
+                if should_send:
+                    formatted_comments = [f"- {r}" for r in display_comments]
+                    comments_str = (
+                        "\n".join(formatted_comments)
+                        if formatted_comments
+                        else "표시할 새 댓글이 없습니다."
+                    )
+
+                    category = "🚨 " if is_toss_valid else "💚 "
+                    title_prefix = (
+                        category if is_first_time else f"💬[추가댓글] {category}"
+                    )
+
+                    alert_msg = (
+                        f"{title_prefix}{title_text}\n"
+                        f"📄 본문: {content.strip()[:100]}\n"
+                    )
+
+                    if is_first_time:
+                        alert_msg += f"💬 댓글요약:\n{comments_str}\n"
+                    else:
+                        alert_msg += f"💬 새로 달린 댓글:\n{comments_str}\n"
+
+                    alert_msg += f"🔗 링크: {post_url}"
+
+                    send_telegram_message(alert_msg)
+
+                    # 🎯 최초 발송인 경우에만 시간 기록을 유지하고, 댓글만 최신 상태로 기록 보존
+                    if is_first_time:
+                        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        sent_posts[post_no] = {
+                            "time": now_str,
+                            "comments": current_comments,
+                        }
+                    else:
+                        sent_posts[post_no]["comments"] = current_comments
+
+                    db_updated = True
+                    time.sleep(1.5)
+
+        if db_updated:
+            save_all_posts(sent_posts)
 
     except Exception as e:
         logger.error(f"❌ 크롤링 중 에러 발생: {e}")
