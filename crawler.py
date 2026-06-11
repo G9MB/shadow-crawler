@@ -7,38 +7,87 @@ from bs4 import BeautifulSoup
 import time
 import re
 import random
+import logging
+from logging.handlers import TimedRotatingFileHandler
+from datetime import datetime
 
-# 🎯 환경변수 이름 일치 (대소문자 및 철자 수정)
+# ================================================================= #
+# ⭐ [유저 설정 구역] 관리용 키워드 리스트
+# ================================================================= #
+# 1. 토스 관련 키워드 (포함할 단어 / 제외할 단어)
+INCLUDE_TOSS = ["토스"]
+EXCLUDE_TOSS = ["토스트", "팀플"]
+
+# 2. 네이버 페이 관련 키워드 (기본 포함 단어 / 매칭될 필수 단어)
+INCLUDE_NAVER = ["네이버"]
+MATCH_NAVER = ["180", "100"]
+
+# 3. 댓글에서 제외할 단순 인사성 단어 목록
+EXCLUDE_COMMENTS = ["감사", "고맙", "추천", "ㅊㅊ", "ㄱㅅ"]
+
+# 4. 파일 경로 설정 (크론탭 환경 대응 절대 경로)
+LOG_FILE_PATH = "/home/swkim/shadow-crawler/crawler.log"
+DB_FILE = "/home/swkim/shadow-crawler/sent_posts.txt"
+# ================================================================= #
+
+# 로그 시스템 설정 (하루 단위 로테이션 및 자정 자동 파기)
+logger = logging.getLogger("CrawlerLogger")
+logger.setLevel(logging.INFO)
+
+log_handler = TimedRotatingFileHandler(
+    filename=LOG_FILE_PATH, when="midnight", interval=1, backupCount=1, encoding="utf-8"
+)
+
+formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+)
+log_handler.setFormatter(formatter)
+logger.addHandler(log_handler)
+
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(formatter)
+logger.addHandler(stream_handler)
+
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-DB_FILE = "sent_posts.txt"
-
 
 def load_sent_posts():
-    """파일에서 이미 발송한 게시글 제목 목록을 읽어옵니다."""
+    """파일에서 {글번호: 최초발송시간} 구조의 딕셔너리를 읽어옵니다."""
+    sent_dict = {}
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r", encoding="utf-8") as f:
-            return set(line.strip() for line in f if line.strip())
-    return set()
+            for line in f:
+                line = line.strip()
+                if not line or "," not in line:
+                    continue
+                time_str, post_no = line.split(",", 1)
+                try:
+                    sent_dict[post_no] = datetime.strptime(
+                        time_str, "%Y-%m-%d %H:%M:%S"
+                    )
+                except ValueError:
+                    continue
+    return sent_dict
 
 
-def save_sent_post(title):
-    """새로 발송한 게시글 제목을 파일에 기록합니다."""
+def save_sent_post(post_no):
+    """새로 발송한 게시글의 글 번호를 현재 시간과 함께 파일에 기록합니다."""
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(DB_FILE, "a", encoding="utf-8") as f:
-        f.write(title + "\n")
+        f.write(f"{now_str},{post_no}\n")
 
 
 def send_telegram_message(text):
     if not TOKEN or not CHAT_ID:
-        print("❌ 텔레그램 토큰 또는 CHAT_ID가 설정되지 않았습니다.")
+        logger.error("❌ 텔레그램 토큰 또는 CHAT_ID가 설정되지 않았습니다.")
         return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text}
     try:
         requests.post(url, json=payload)
     except Exception as e:
-        print(f"❌ 텔레그램 발송 에러: {e}")
+        logger.error(f"❌ 텔레그램 발송 에러: {e}")
 
 
 def get_detail_content(post_url):
@@ -71,22 +120,27 @@ def get_detail_content(post_url):
             '.comment_memo, .comment_text, .comment-content, div[class*="comment_"]'
         )
         comments = []
-        for i, reply in enumerate(comment_elements):
-            if i >= 5:
+
+        for reply in comment_elements:
+            if len(comments) >= 5:
                 break
+
             reply_text = reply.get_text().strip()
             reply_text = re.sub(r"\s+", " ", reply_text)
+
             if reply_text and len(reply_text) > 1:
+                # 🎯 상단에 정의한 EXCLUDE_COMMENTS 리스트 조건 대조 및 필터링
+                if any(keyword in reply_text for keyword in EXCLUDE_COMMENTS):
+                    continue
                 comments.append(f"- {reply_text}")
 
         return content_text, comments
     except Exception as e:
-        print(f"❌ 상세 페이지 분석 에러: {e}")
+        logger.error(f"❌ 상세 페이지 분석 에러: {e}")
         return "본문 로딩 실패", []
 
 
 def check_ppomppu_coupon():
-    # 실행할 때마다 저장된 파일에서 기존 발송 목록을 불러옵니다.
     sent_posts = load_sent_posts()
 
     url = "https://m.ppomppu.co.kr/new/bbs_list.php?id=coupon&extref=1"
@@ -97,7 +151,7 @@ def check_ppomppu_coupon():
     try:
         response = requests.get(url, headers=headers)
         if response.status_code != 200:
-            print(f"❌ 뽐뿌 서버 접속 실패")
+            logger.error("❌ 뽐뿌 서버 접속 실패")
             return
 
         soup = BeautifulSoup(response.text, "html.parser")
@@ -108,9 +162,7 @@ def check_ppomppu_coupon():
                 a for a in soup.find_all("a") if "bbs_view.php" in a.get("href", "")
             ]
 
-        print(
-            f"🔄 현재 시간 {time.strftime('%Y-%m-%d %H:%M:%S')} - 게시글 {len(titles)}개 스캔 중..."
-        )
+        logger.info(f"🔄 게시글 {len(titles)}개 스캔 중...")
 
         for item in titles:
             raw_text = item.get_text().strip()
@@ -126,29 +178,36 @@ def check_ppomppu_coupon():
             if not title_text or len(title_text) < 3:
                 continue
 
-            # 복합 조건 필터링 (토스 OR 네이버+180)
-            if (
-                ("토스" in title_text)
-                and not ("토스트" in title_text or "팀플" in title_text)
-            ) or (("네이버" in title_text) and ("180" in title_text or "100" in title_text)):
+            raw_href = item.get("href", "")
+            if not raw_href:
+                continue
 
-                if title_text in sent_posts:
-                    continue
+            no_match = re.search(r"no=(\d+)", raw_href)
+            if not no_match:
+                continue
 
-                raw_href = item.get("href", "")
-                if not raw_href:
-                    continue
+            post_no = no_match.group(1)
+            post_url = (
+                f"https://m.ppomppu.co.kr/new/bbs_view.php?id=coupon&no={post_no}"
+            )
 
-                no_match = re.search(r"no=(\d+)", raw_href)
-                if no_match:
-                    post_no = no_match.group(1)
-                    post_url = f"https://m.ppomppu.co.kr/new/bbs_view.php?id=coupon&no={post_no}"
-                else:
-                    post_url = (
-                        "https://m.ppomppu.co.kr/new/" + raw_href
-                        if not raw_href.startswith("http")
-                        else raw_href
-                    )
+            # 🎯 any() 문법을 적용하여 축약된 대괄호 리스트 키워드 필터링
+            is_toss_valid = any(w in title_text for w in INCLUDE_TOSS) and not any(
+                w in title_text for w in EXCLUDE_TOSS
+            )
+            is_naver_valid = any(w in title_text for w in INCLUDE_NAVER) and any(
+                w in title_text for w in MATCH_NAVER
+            )
+
+            if is_toss_valid or is_naver_valid:
+
+                # 🎯 최초 발송 기록 대조 및 20분(1200초) 타임아웃 락 검사
+                if post_no in sent_posts:
+                    first_sent_time = sent_posts[post_no]
+                    time_passed = datetime.now() - first_sent_time
+
+                    if time_passed.total_seconds() > 1200:
+                        continue
 
                 content, comments_list = get_detail_content(post_url)
                 comments_str = (
@@ -157,53 +216,44 @@ def check_ppomppu_coupon():
                     else "등록된 댓글이 없습니다."
                 )
 
-                # 기존 alert_msg 윗부분에 아래 로직 추가
-                if "토스" in title_text:
-                    category = "🚨"
-                else:
-                    category = "💚"
+                category = "🚨 " if is_toss_valid else "💚 "
 
-                # 1. 팝업 배너에서 바로 보일 상단부 (링크와 불필요한 빈 줄을 없앰)
+                # 팝업 배너 최적화 메시지 생성
                 alert_msg = (
-                    f"{category}{title_text}\n"  # 첫 줄: 카테고리와 제목 결합
-                    f"📄 본문: {content.strip()[:100]}\n"  # 둘째 줄: 본문 핵심 100자
+                    f"{category}{title_text}\n" f"📄 본문: {content.strip()[:100]}\n"
                 )
 
-                # 2. 댓글 요약을 바로 밑에 바짝 붙여서 배너 영역 안으로 끌어올림
                 if comments_list:
-                    # 댓글들을 줄바꿈(\n)으로 이어 붙이되, 배너 공간을 위해 앞에 붙던 빈 줄 제거
-                    alert_msg += f"💬 댓글: {comments_str}\n"
+                    alert_msg += f"💬 댓글요약:\n{comments_str}\n"
                 else:
                     alert_msg += "💬 댓글: 등록된 댓글이 없습니다.\n"
 
-                # 3. 링크는 맨 밑으로 유배 (배너에서는 잘려서 안 보이고, 앱에 들어가야만 보임)
                 alert_msg += f"🔗 링크: {post_url}"
 
-
                 send_telegram_message(alert_msg)
-                save_sent_post(title_text)  # 🎯 중복 차단을 위해 영구 파일에 저장
+
+                # 중복 및 20분 검사용 고유 글 번호 저장
+                save_sent_post(post_no)
                 time.sleep(1.5)
 
     except Exception as e:
-        print(f"❌ 크롤링 중 에러 발생: {e}")
+        logger.error(f"❌ 크롤링 중 에러 발생: {e}")
 
 
-# 🎯 무한 루프 없이 깃허브가 깨워주면 25~35초 간격으로 '딱 8번' 스캔하고 종료
 if __name__ == "__main__":
-    print("🚀 [GitHub Actions] 정각/30분 트리거 발동. 8회 집중 정찰을 시작합니다.")
+    logger.info("🚀 [Crontab] 30분 주기 트리거 발동. 8회 집중 정찰을 시작합니다.")
 
-    # 1부터 8까지 정확히 8번 반복 실행하도록 변경
     for attempt in range(1, 9):
-        print(f"🕵️‍♂️ [{attempt}/8 번째 정찰 수행 중...]")
+        logger.info(f"🕵️‍♂️ [{attempt}/8 번째 정찰 수행 중...]")
         check_ppomppu_coupon()
 
-        # 8번째 마지막 크롤링을 마쳤다면 더 이상 대기할 필요가 없으므로 루프 탈출
         if attempt == 8:
             break
 
-        # 🎯 [변경 포인트] 다음 스캔까지 25초에서 35초 사이의 무작위 초 선택
         next_sleep = random.randint(25, 35)
-        print(f"⏳ 보안 우회 및 밀착 감시를 위해 {next_sleep}초 대기 후 다음 스캔...")
+        logger.info(
+            f"⏳ 보안 우회 및 밀착 감시를 위해 {next_sleep}초 대기 후 다음 스캔..."
+        )
         time.sleep(next_sleep)
 
-    print("✅ 8회 집중 밀착 정찰 완료. 가상 서버를 안전하게 종료합니다.")
+    logger.info("✅ 8회 집중 밀착 정찰 완료. 작업을 마칩니다.")
