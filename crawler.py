@@ -305,13 +305,13 @@ def check_ppomppu_coupon():
 
 
 if __name__ == "__main__":
-    logger.info("🚀 [Crontab] 30분 주기 트리거 발동. 8회 집중 정찰을 시작합니다.")
+    logger.info("🚀 [Crontab] 30분 주기 트리거 발동. 15회 집중 정찰을 시작합니다.")
 
-    for attempt in range(1, 9):
-        logger.info(f"🕵️‍♂️ [{attempt}/8 번째 정찰 수행 중...]")
+    for attempt in range(1, 16):
+        logger.info(f"🕵️‍♂️ [{attempt}/15 번째 정찰 수행 중...]")
         check_ppomppu_coupon()
 
-        if attempt == 8:
+        if attempt == 15:
             break
 
         next_sleep = random.randint(25, 35)
@@ -320,4 +320,4 @@ if __name__ == "__main__":
         )
         time.sleep(next_sleep)
 
-    logger.info("✅ 8회 집중 밀착 정찰 완료. 작업을 마칩니다.")
+    logger.info("✅ 15회 집중 밀착 정찰 완료. 작업을 마칩니다.")
