@@ -21,7 +21,7 @@ EXCLUDE_TOSS = ["토스트", "알바"]
 
 # 2. 네이버 페이 관련 키워드 (기본 포함 단어 / 매칭될 필수 단어)
 INCLUDE_NAVER = ["네이버"]
-MATCH_NAVER = ["180", "100"]
+MATCH_NAVER = ["180", "100", "120"]
 
 # 3. 필터링할 댓글 제외 단어 목록
 EXCLUDE_COMMENTS = ["감사", "고맙", "추천", "ㅊㅊ", "ㄱㅅ", "종료"]
@@ -320,5 +320,5 @@ if __name__ == "__main__":
         )
         time.sleep(next_sleep)
 
-    logger.info("✅ 15회/10분 스캔 완료. 작업을 마칩니다.")
+    logger.info("✅ 45회/10분 스캔 완료. 작업을 마칩니다.")
     
