@@ -24,7 +24,7 @@ INCLUDE_NAVER = ["네이버"]
 MATCH_NAVER = ["180", "100", "120"]
 
 # 3. 필터링할 댓글 제외 단어 목록
-EXCLUDE_COMMENTS = ["감사", "고맙", "추천", "ㅊㅊ", "ㄱㅅ", "종료"]
+EXCLUDE_COMMENTS = ["감사", "고맙", "추천", "ㅊㅊ", "ㄱㅅ", "종료", "중복]
 
 # 4. 파일 경로 설정 (크론탭 환경 대응 절대 경로)
 LOG_FILE_PATH = "/home/swkim/shadow-crawler/crawler.log"
