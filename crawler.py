@@ -1,324 +1,183 @@
 import os
+import random
+import time
+from bs4 import BeautifulSoup
+from curl_cffi import requests
 from dotenv import load_dotenv
 
+# 환경변수 로드 (.env 파일에서 TELEGRAM_TOKEN, TELEGRAM_CHAT_ID 읽기)
 load_dotenv()
-import requests
-from bs4 import BeautifulSoup
-import time
-import re
-import random
-import logging
-from logging.handlers import TimedRotatingFileHandler
-import json
-from datetime import datetime
 
-# ================================================================= #
-# ⭐ [유저 설정 구역] 관리용 키워드 리스트
-# ================================================================= #
-# 1. 토스 관련 키워드 (포함할 단어 / 제외할 단어)
-INCLUDE_TOSS = ["토스"]
-EXCLUDE_TOSS = ["토스트", "알바"]
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# 2. 네이버 페이 관련 키워드 (기본 포함 단어 / 매칭될 필수 단어)
-INCLUDE_NAVER = ["네이버"]
-MATCH_NAVER = ["180", "100", "120"]
+TARGET_URL = "https://m.ppomppu.co.kr/new/bbs_list.php?id=coupon"
+BASE_URL = "https://m.ppomppu.co.kr/new/"
 
-# 3. 필터링할 댓글 제외 단어 목록
-EXCLUDE_COMMENTS = ["감사", "고맙", "추천", "ㅊㅊ", "ㄱㅅ", "종료", "중복"]
+# 이전에 발송한 글의 ID를 저장할 집합
+seen_post_ids = set()
 
-# 4. 파일 경로 설정 (크론탭 환경 대응 절대 경로)
-LOG_FILE_PATH = "/home/swkim/shadow-crawler/crawler.log"
-DB_FILE = "/home/swkim/shadow-crawler/sent_posts.txt"
-# ================================================================= #
-
-# 로그 시스템 설정
-logger = logging.getLogger("CrawlerLogger")
-logger.setLevel(logging.INFO)
-
-log_handler = TimedRotatingFileHandler(
-    filename=LOG_FILE_PATH, when="midnight", interval=1, backupCount=1, encoding="utf-8"
-)
-
-formatter = logging.Formatter(
-    "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-)
-log_handler.setFormatter(formatter)
-logger.addHandler(log_handler)
-
-stream_handler = logging.StreamHandler()
-stream_handler.setFormatter(formatter)
-logger.addHandler(stream_handler)
-
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+# 최근에 성공했던 프록시를 기억하기 위한 변수
+working_proxy = None
 
 
-def load_sent_posts():
-    """파일에서 {글번호: {"time": "시간", "comments": [...]}} 구조를 읽어옵니다."""
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-                if content:
-                    return json.loads(content)
-        except Exception as e:
-            logger.error(f"❌ DB 파일 읽기 실패 (새로 생성합니다): {e}")
-    return {}
-
-
-def save_all_posts(posts_dict):
-    """전체 데이터 딕셔너리를 JSON 형태로 파일에 저장합니다."""
-    try:
-        with open(DB_FILE, "w", encoding="utf-8") as f:
-            json.dump(posts_dict, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"❌ DB 파일 저장 실패: {e}")
-
-
-def send_telegram_message(text):
-    if not TOKEN or not CHAT_ID:
-        logger.error("❌ 텔레그램 토큰 또는 CHAT_ID가 설정되지 않았습니다.")
+def send_telegram_message(message):
+    """텔레그램 알림 발송 함수"""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[경고] 텔레그램 토큰 또는 Chat ID가 설정되지 않았습니다.")
         return
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text}
-    try:
-        requests.post(url, json=payload)
-    except Exception as e:
-        logger.error(f"❌ 텔레그램 발송 에러: {e}")
 
-
-def get_detail_content(post_url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False,
     }
     try:
-        response = requests.get(post_url, headers=headers)
-        if response.status_code != 200:
-            return "본문 페이지 접속 실패", []
-
-        soup = BeautifulSoup(response.text, "html.parser")
-        content_div = soup.select_one(
-            ".board-contents, .pic_bg, .bbs_view_content, .cont"
-        )
-
-        if not content_div:
-            content_div = soup.select_one("#mainContent")
-
-        content_text = (
-            content_div.get_text().strip()
-            if content_div
-            else "본문 내용을 파싱할 수 없는 구조입니다."
-        )
-        content_text = re.sub(r"\n+", "\n", content_text)
-        if len(content_text) > 250:
-            content_text = content_text[:250] + "...(지면상 생략)"
-
-        comment_elements = soup.select(
-            '.comment_memo, .comment_text, .comment-content, div[class*="comment_"]'
-        )
-        comments = []
-
-        for reply in comment_elements:
-            if len(comments) >= 10:
-                break
-            reply_text = reply.get_text().strip()
-            reply_text = re.sub(r"\s+", " ", reply_text)
-            if reply_text and len(reply_text) > 1:
-                comments.append(reply_text)
-
-        return content_text, comments
+        requests.post(url, json=payload, timeout=5)
     except Exception as e:
-        logger.error(f"❌ 상세 페이지 분석 에러: {e}")
-        return "본문 로딩 실패", []
+        print(f"[텔레그램 발송 실패] {e}")
 
 
-def check_ppomppu_coupon():
-    # 데이터 구조: { "글번호": {"time": "2026-06-11 21:00:00", "comments": ["댓1", "댓2"]} }
-    sent_posts = load_sent_posts()
-    db_updated = False
-
-    url = "https://m.ppomppu.co.kr/new/bbs_list.php?id=coupon&extref=1"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-
+def fetch_free_proxies():
+    """ProxyScrape API에서 무료 HTTP 프록시 목록 수집"""
+    api_url = "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=3000&country=all&ssl=all&anonymity=all"
     try:
-        response = requests.get(url, headers=headers)
-        if response.status_code != 200:
-            logger.error("❌ 뽐뿌 서버 접속 실패")
-            return
-
-        soup = BeautifulSoup(response.text, "html.parser")
-        titles = soup.select("a.title_a, a.list_title, span.title, td.title a")
-
-        if len(titles) == 0:
-            titles = [
-                a for a in soup.find_all("a") if "bbs_view.php" in a.get("href", "")
+        r = requests.get(api_url, timeout=5)
+        if r.status_code == 200:
+            proxies = [
+                p.strip() for p in r.text.strip().split("\r\n") if p.strip()
             ]
-
-        logger.info(f"🔄 게시글 {len(titles)}개 스캔 중...")
-
-        for item in titles:
-            raw_text = item.get_text().strip()
-            if not raw_text:
-                continue
-
-            lines = [line.strip() for line in raw_text.split("\n") if line.strip()]
-            if not lines:
-                continue
-            title_text = lines[0]
-            title_text = re.sub(r"\s+", " ", title_text)
-
-            if not title_text or len(title_text) < 3:
-                continue
-
-            raw_href = item.get("href", "")
-            if not raw_href:
-                continue
-
-            no_match = re.search(r"no=(\d+)", raw_href)
-            if not no_match:
-                continue
-
-            post_no = no_match.group(1)
-            post_url = (
-                f"https://m.ppomppu.co.kr/new/bbs_view.php?id=coupon&no={post_no}"
-            )
-
-            # [조건 1] 제목 키워드 검사
-            is_toss_valid = any(w in title_text for w in INCLUDE_TOSS) and not any(
-                w in title_text for w in EXCLUDE_TOSS
-            )
-            is_naver_valid = any(w in title_text for w in INCLUDE_NAVER) and any(
-                w in title_text for w in MATCH_NAVER
-            )
-
-            if is_toss_valid or is_naver_valid:
-
-                is_first_time = post_no not in sent_posts
-
-                # 🎯 [추가] 20분 시간 타임아웃 락 검사
-                if not is_first_time:
-                    first_sent_time_str = sent_posts[post_no]["time"]
-                    first_sent_time = datetime.strptime(
-                        first_sent_time_str, "%Y-%m-%d %H:%M:%S"
-                    )
-                    time_passed = datetime.now() - first_sent_time
-
-                    # 최초 발송 후 20분(1200초)이 경과했다면 댓글 변화조차 체크하지 않고 무조건 제외
-                    if time_passed.total_seconds() > 1200:
-                        continue
-
-                # 본문 및 최신 댓글 수집
-                content, current_comments = get_detail_content(post_url)
-
-                should_send = False
-
-                if is_first_time:
-                    # [조건 1] 최초 글 발견 시 무조건 알림 승인
-                    should_send = True
-                    display_comments = current_comments[:5]
-                else:
-                    # 재방문인 경우 (20분 이내 내부 변화 추적)
-                    old_comments = sent_posts[post_no]["comments"]
-
-                    # [조건 3] 새로 추가된 댓글만 필터링
-                    new_comments = [
-                        c for c in current_comments if c not in old_comments
-                    ]
-
-                    if not new_comments:
-                        # [조건 2] 추가된 댓글이 없다면 알림 제외
-                        continue
-
-                    # [조건 4] 추가된 댓글 전부가 제외 단어인 경우 알림 자체를 제외
-                    all_new_are_exclude = all(
-                        any(k in nc for k in EXCLUDE_COMMENTS) for nc in new_comments
-                    )
-                    if all_new_are_exclude:
-                        # 파일 내부의 댓글 데이터만 최신화하고 알림은 스킵
-                        sent_posts[post_no]["comments"] = current_comments
-                        db_updated = True
-                        continue
-
-                    # [조건 5] 감사 댓글은 빼고 실질적인 정보성 새 댓글만 추출
-                    valid_new_comments = [
-                        nc
-                        for nc in new_comments
-                        if not any(k in nc for k in EXCLUDE_COMMENTS)
-                    ]
-
-                    if valid_new_comments:
-                        should_send = True
-                        display_comments = valid_new_comments[:5]
-                    else:
-                        # 필터링 후 남은 새 댓글이 없다면 알림 제외
-                        sent_posts[post_no]["comments"] = current_comments
-                        db_updated = True
-                        continue
-
-                if should_send:
-                    formatted_comments = [f"- {r}" for r in display_comments]
-                    comments_str = (
-                        "\n".join(formatted_comments)
-                        if formatted_comments
-                        else "표시할 새 댓글이 없습니다."
-                    )
-
-                    category = "🚨 " if is_toss_valid else "💚 "
-                    title_prefix = (
-                        category if is_first_time else f"💬[추가댓글] {category}"
-                    )
-
-                    alert_msg = (
-                        f"{title_prefix}{title_text}\n"
-                        f"📄 본문: {content.strip()[:100]}\n"
-                    )
-
-                    if is_first_time:
-                        alert_msg += f"💬 댓글요약:\n{comments_str}\n"
-                    else:
-                        alert_msg += f"💬 새로 달린 댓글:\n{comments_str}\n"
-
-                    alert_msg += f"🔗 링크: {post_url}"
-
-                    send_telegram_message(alert_msg)
-
-                    # 🎯 최초 발송인 경우에만 시간 기록을 유지하고, 댓글만 최신 상태로 기록 보존
-                    if is_first_time:
-                        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        sent_posts[post_no] = {
-                            "time": now_str,
-                            "comments": current_comments,
-                        }
-                    else:
-                        sent_posts[post_no]["comments"] = current_comments
-
-                    db_updated = True
-                    time.sleep(1.5)
-
-        if db_updated:
-            save_all_posts(sent_posts)
-
+            return proxies
     except Exception as e:
-        logger.error(f"❌ 크롤링 중 에러 발생: {e}")
+        print(f"[프록시 리스트 수집 실패] {e}")
+    return []
+
+
+def get_html_with_proxy(url):
+    """무료 프록시를 순환하며 200 OK 응답을 얻을 때까지 요청 시도"""
+    global working_proxy
+
+    # 1. 이전 실행에서 성공했던 프록시가 있다면 우선 시도
+    if working_proxy:
+        try:
+            session = requests.Session(impersonate="chrome120")
+            session.proxies = {
+                "http": working_proxy,
+                "https": working_proxy,
+            }
+            res = session.get(url, timeout=4)
+            if res.status_code == 200:
+                return res.text
+        except Exception:
+            working_proxy = None  # 이전 프록시가 죽었으면 초기화
+
+    # 2. 새로운 무료 프록시 리스트 가져오기
+    proxies = fetch_free_proxies()
+    if not proxies:
+        print("[오류] 사용 가능한 프록시 목록을 가져올 수 없습니다.")
+        return None
+
+    random.shuffle(proxies)
+
+    # 3. 최대 15개 프록시까지 순차 테스트
+    for proxy in proxies[:15]:
+        proxy_url = f"http://{proxy}"
+        try:
+            session = requests.Session(impersonate="chrome120")
+            session.proxies = {"http": proxy_url, "https": proxy_url}
+
+            res = session.get(url, timeout=4)
+
+            # 200 OK로 성공했을 때
+            if res.status_code == 200:
+                print(f"[성공] 프록시 우회 성공: {proxy_url}")
+                working_proxy = proxy_url  # 성공한 프록시 저장
+                return res.text
+            elif res.status_code == 403:
+                print(f"[차단] 403 Forbidden ({proxy_url}) -> 다음 프록시 시도")
+
+        except Exception:
+            # 타임아웃이나 연결 끊김 시 조용히 넘어감
+            pass
+
+    print("[실패] 시도한 모든 프록시가 차단되었거나 응답이 없습니다.")
+    return None
+
+
+def parse_and_notify(html):
+    """뽐뿌 게재글 파싱 및 신규 글 알림 텔레그램 전송"""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 뽐뿌 모바일 게시판 리스트 파싱
+    posts = soup.select("ul.bbsList > li")
+
+    new_posts_count = 0
+
+    for post in reversed(posts):  # 과거 글부터 처리
+        try:
+            # 공지사항이나 카테고리 태그 예외 처리
+            title_tag = post.select_one("span.title")
+            link_tag = post.select_one("a")
+
+            if not title_tag or not link_tag:
+                continue
+
+            title = title_tag.get_text(strip=True)
+            link = BASE_URL + link_tag["href"]
+
+            # URL에서 게시글 고유 ID 추출 (예: no=123456)
+            post_id = link.split("no=")[-1].split("&")[0]
+
+            # 이미 확인한 글이면 건너뜀
+            if post_id in seen_post_ids:
+                continue
+
+            # 최초 실행 시에는 기존 글들을 '이미 본 글'로 등록만 하고 알림은 쏘지 않음
+            if len(seen_post_ids) == 0:
+                seen_post_ids.add(post_id)
+                continue
+
+            # 신규 글 등록 및 알림 전송
+            seen_post_ids.add(post_id)
+            new_posts_count += 1
+
+            msg = f"<b>[뽐뿌 쿠폰 알림]</b>\n\n{title}\n\n<a href='{link}'>게시글 바로가기</a>"
+            send_telegram_message(msg)
+            print(f"[알림 발송] {title}")
+
+        except Exception as e:
+            print(f"[파싱 에러] {e}")
+
+    if new_posts_count > 0:
+        print(f"총 {new_posts_count}개의 새로운 알림을 보냈습니다.")
+
+
+def main():
+    print("=== 뽐뿌 크롤러 시작 (GCP 프록시 우회 모드) ===")
+
+    # 1. 첫 실행 시 게시판을 읽어와서 기존 글 ID들을 초기 세팅
+    print("초기 게시글 목록을 수집합니다...")
+    html = get_html_with_proxy(TARGET_URL)
+    if html:
+        parse_and_notify(html)
+        print(f"초기 세팅 완료 (기존 글 {len(seen_post_ids)}개 등록됨)")
+
+    # 2. 루프를 돌며 주기적으로 크롤링 (예: 30초 간격)
+    while True:
+        try:
+            time.sleep(30)
+            print("\n[주기적 수집 시도]")
+            html = get_html_with_proxy(TARGET_URL)
+            if html:
+                parse_and_notify(html)
+        except KeyboardInterrupt:
+            print("\n크롤러를 종료합니다.")
+            break
+        except Exception as e:
+            print(f"[메인 루프 에러] {e}")
 
 
 if __name__ == "__main__":
-    logger.info("🚀 45회/10분 스캔 시작")
-
-    for attempt in range(1, 46):
-        logger.info(f"🕵️‍♂️ [{attempt}/45 번째 스캔 중...]")
-        check_ppomppu_coupon()
-
-        if attempt == 45:
-            break
-
-        next_sleep = random.uniform(10.0, 15.0)
-        logger.info(
-            f"⏳ {next_sleep}초 대기 후 다음 스캔..."
-        )
-        time.sleep(next_sleep)
-
-    logger.info("✅ 45회/10분 스캔 완료. 작업을 마칩니다.")
-    
+    main()
