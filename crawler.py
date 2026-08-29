@@ -16,7 +16,7 @@ from datetime import datetime
 # ⭐ [유저 설정 구역] Cloudflare Worker 및 크롤링 옵션
 # ================================================================= #
 # 0. Cloudflare Worker URL (본인의 서브도메인 주소로 변경하세요)
-WORKER_URL = "https://ppomppu-proxy.gohanbit22.workers.dev"
+WORKER_URL = "https://wispy-sky-61bb.gohanbit22.workers.dev"
 
 # 1. 토스 관련 키워드 (포함할 단어 / 제외할 단어)
 INCLUDE_TOSS = ["토스"]
