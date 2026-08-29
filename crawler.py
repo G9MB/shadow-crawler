@@ -1,183 +1,250 @@
 import os
-import random
-import time
-from bs4 import BeautifulSoup
-from curl_cffi import requests
 from dotenv import load_dotenv
 
-# 환경변수 로드 (.env 파일에서 TELEGRAM_TOKEN, TELEGRAM_CHAT_ID 읽기)
 load_dotenv()
+import requests
+from bs4 import BeautifulSoup
+import time
+import re
+import random
+import logging
+from logging.handlers import TimedRotatingFileHandler
+import json
+from datetime import datetime
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# ================================================================= #
+# ⭐ [유저 설정 구역] Cloudflare Worker 및 크롤링 옵션
+# ================================================================= #
+# 0. Cloudflare Worker URL (본인의 서브도메인 주소로 변경하세요)
+WORKER_URL = "https://ppomppu-proxy.gohanbit22.workers.dev"
 
-TARGET_URL = "https://m.ppomppu.co.kr/new/bbs_list.php?id=coupon"
-BASE_URL = "https://m.ppomppu.co.kr/new/"
+# 1. 토스 관련 키워드 (포함할 단어 / 제외할 단어)
+INCLUDE_TOSS = ["토스"]
+EXCLUDE_TOSS = ["토스트", "알바"]
 
-# 이전에 발송한 글의 ID를 저장할 집합
-seen_post_ids = set()
+# 2. 네이버 페이 관련 키워드 (기본 포함 단어 / 매칭될 필수 단어)
+INCLUDE_NAVER = ["네이버"]
+MATCH_NAVER = ["180", "100", "120"]
 
-# 최근에 성공했던 프록시를 기억하기 위한 변수
-working_proxy = None
+# 3. 파일 경로 설정 (크론탭 환경 대응 절대 경로)
+LOG_FILE_PATH = "/home/swkim/shadow-crawler/crawler.log"
+DB_FILE = "/home/swkim/shadow-crawler/sent_posts.txt"
+# ================================================================= #
+
+# 로그 시스템 설정
+logger = logging.getLogger("CrawlerLogger")
+logger.setLevel(logging.INFO)
+
+log_handler = TimedRotatingFileHandler(
+    filename=LOG_FILE_PATH, when="midnight", interval=1, backupCount=1, encoding="utf-8"
+)
+
+formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+)
+log_handler.setFormatter(formatter)
+logger.addHandler(log_handler)
+
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(formatter)
+logger.addHandler(stream_handler)
+
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 
-def send_telegram_message(message):
-    """텔레그램 알림 발송 함수"""
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[경고] 텔레그램 토큰 또는 Chat ID가 설정되지 않았습니다.")
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False,
-    }
-    try:
-        requests.post(url, json=payload, timeout=5)
-    except Exception as e:
-        print(f"[텔레그램 발송 실패] {e}")
-
-
-def fetch_free_proxies():
-    """ProxyScrape API에서 무료 HTTP 프록시 목록 수집"""
-    api_url = "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=3000&country=all&ssl=all&anonymity=all"
-    try:
-        r = requests.get(api_url, timeout=5)
-        if r.status_code == 200:
-            proxies = [
-                p.strip() for p in r.text.strip().split("\r\n") if p.strip()
-            ]
-            return proxies
-    except Exception as e:
-        print(f"[프록시 리스트 수집 실패] {e}")
+def load_sent_posts():
+    """파일에서 이미 발송한 글번호 리스트 [ "1234", "1235" ] 구조를 읽어옵니다."""
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    return json.loads(content)
+        except Exception as e:
+            logger.error(f"❌ DB 파일 읽기 실패 (새로 생성합니다): {e}")
     return []
 
 
-def get_html_with_proxy(url):
-    """무료 프록시를 순환하며 200 OK 응답을 얻을 때까지 요청 시도"""
-    global working_proxy
+def save_sent_posts(posts_list):
+    """발송 완료된 글번호 리스트를 JSON 형태로 파일에 저장합니다."""
+    try:
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(posts_list, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"❌ DB 파일 저장 실패: {e}")
 
-    # 1. 이전 실행에서 성공했던 프록시가 있다면 우선 시도
-    if working_proxy:
-        try:
-            session = requests.Session(impersonate="chrome120")
-            session.proxies = {
-                "http": working_proxy,
-                "https": working_proxy,
-            }
-            res = session.get(url, timeout=4)
-            if res.status_code == 200:
-                return res.text
-        except Exception:
-            working_proxy = None  # 이전 프록시가 죽었으면 초기화
 
-    # 2. 새로운 무료 프록시 리스트 가져오기
-    proxies = fetch_free_proxies()
-    if not proxies:
-        print("[오류] 사용 가능한 프록시 목록을 가져올 수 없습니다.")
+def send_telegram_message(text):
+    if not TOKEN or not CHAT_ID:
+        logger.error("❌ 텔레그램 토큰 또는 CHAT_ID가 설정되지 않았습니다.")
+        return
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text}
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        logger.error(f"❌ 텔레그램 발송 에러: {e}")
+
+
+def fetch_via_worker(target_url):
+    """Cloudflare Worker 프록시를 거쳐 대상 웹페이지 HTML을 안전하게 받아옵니다."""
+    try:
+        proxy_url = f"{WORKER_URL}?target={target_url}"
+        response = requests.get(proxy_url, timeout=15)
+        
+        if response.status_code == 200:
+            return response.content.decode("euc-kr", errors="replace")
+        else:
+            logger.error(f"❌ Worker 응답 에러 (Status: {response.status_code})")
+            return None
+    except Exception as e:
+        logger.error(f"❌ Worker 중계 요청 실패: {e}")
         return None
 
-    random.shuffle(proxies)
 
-    # 3. 최대 15개 프록시까지 순차 테스트
-    for proxy in proxies[:15]:
-        proxy_url = f"http://{proxy}"
-        try:
-            session = requests.Session(impersonate="chrome120")
-            session.proxies = {"http": proxy_url, "https": proxy_url}
+def get_detail_content(post_url):
+    """게시글 상세 페이지에서 본문 내용만 추출합니다 (댓글 제외)."""
+    try:
+        html_text = fetch_via_worker(post_url)
+        if not html_text:
+            return "본문 페이지 접속 실패"
 
-            res = session.get(url, timeout=4)
+        soup = BeautifulSoup(html_text, "html.parser")
+        content_div = soup.select_one(
+            ".board-contents, .pic_bg, .bbs_view_content, .cont"
+        )
 
-            # 200 OK로 성공했을 때
-            if res.status_code == 200:
-                print(f"[성공] 프록시 우회 성공: {proxy_url}")
-                working_proxy = proxy_url  # 성공한 프록시 저장
-                return res.text
-            elif res.status_code == 403:
-                print(f"[차단] 403 Forbidden ({proxy_url}) -> 다음 프록시 시도")
+        if not content_div:
+            content_div = soup.select_one("#mainContent")
 
-        except Exception:
-            # 타임아웃이나 연결 끊김 시 조용히 넘어감
-            pass
+        content_text = (
+            content_div.get_text().strip()
+            if content_div
+            else "본문 내용을 파싱할 수 없는 구조입니다."
+        )
+        content_text = re.sub(r"\n+", "\n", content_text)
+        
+        # 본문이 너무 길면 200자로 자르고 생략 표시
+        if len(content_text) > 200:
+            content_text = content_text[:200] + "...(지면상 생략)"
 
-    print("[실패] 시도한 모든 프록시가 차단되었거나 응답이 없습니다.")
-    return None
+        return content_text
+    except Exception as e:
+        logger.error(f"❌ 상세 페이지 본문 분석 에러: {e}")
+        return "본문 로딩 실패"
 
 
-def parse_and_notify(html):
-    """뽐뿌 게재글 파싱 및 신규 글 알림 텔레그램 전송"""
-    soup = BeautifulSoup(html, "html.parser")
+def check_ppomppu_coupon():
+    sent_posts = load_sent_posts()  # 이미 보낸 글번호 리스트
+    db_updated = False
 
-    # 뽐뿌 모바일 게시판 리스트 파싱
-    posts = soup.select("ul.bbsList > li")
+    target_list_url = "https://m.ppomppu.co.kr/new/bbs_list.php?id=coupon&extref=1"
+    
+    # Cloudflare Worker를 통하여 쿠폰 게시판 목록 가져오기
+    html_text = fetch_via_worker(target_list_url)
+    if not html_text:
+        logger.error("❌ 뽐뿌 목록 페이지 수집 실패")
+        return
 
-    new_posts_count = 0
+    try:
+        soup = BeautifulSoup(html_text, "html.parser")
+        titles = soup.select("a.title_a, a.list_title, span.title, td.title a")
 
-    for post in reversed(posts):  # 과거 글부터 처리
-        try:
-            # 공지사항이나 카테고리 태그 예외 처리
-            title_tag = post.select_one("span.title")
-            link_tag = post.select_one("a")
+        if len(titles) == 0:
+            titles = [
+                a for a in soup.find_all("a") if "bbs_view.php" in a.get("href", "")
+            ]
 
-            if not title_tag or not link_tag:
+        logger.info(f"🔄 게시글 {len(titles)}개 스캔 중...")
+
+        for item in titles:
+            raw_text = item.get_text().strip()
+            if not raw_text:
                 continue
 
-            title = title_tag.get_text(strip=True)
-            link = BASE_URL + link_tag["href"]
+            lines = [line.strip() for line in raw_text.split("\n") if line.strip()]
+            if not lines:
+                continue
+            title_text = lines[0]
+            title_text = re.sub(r"\s+", " ", title_text)
 
-            # URL에서 게시글 고유 ID 추출 (예: no=123456)
-            post_id = link.split("no=")[-1].split("&")[0]
-
-            # 이미 확인한 글이면 건너뜀
-            if post_id in seen_post_ids:
+            if not title_text or len(title_text) < 3:
                 continue
 
-            # 최초 실행 시에는 기존 글들을 '이미 본 글'로 등록만 하고 알림은 쏘지 않음
-            if len(seen_post_ids) == 0:
-                seen_post_ids.add(post_id)
+            raw_href = item.get("href", "")
+            if not raw_href:
                 continue
 
-            # 신규 글 등록 및 알림 전송
-            seen_post_ids.add(post_id)
-            new_posts_count += 1
+            no_match = re.search(r"no=(\d+)", raw_href)
+            if not no_match:
+                continue
 
-            msg = f"<b>[뽐뿌 쿠폰 알림]</b>\n\n{title}\n\n<a href='{link}'>게시글 바로가기</a>"
-            send_telegram_message(msg)
-            print(f"[알림 발송] {title}")
+            post_no = no_match.group(1)
 
-        except Exception as e:
-            print(f"[파싱 에러] {e}")
+            # 🎯 이미 보낸 글이면 스킵
+            if post_no in sent_posts:
+                continue
 
-    if new_posts_count > 0:
-        print(f"총 {new_posts_count}개의 새로운 알림을 보냈습니다.")
+            # [조건] 제목 키워드 검사
+            is_toss_valid = any(w in title_text for w in INCLUDE_TOSS) and not any(
+                w in title_text for w in EXCLUDE_TOSS
+            )
+            is_naver_valid = any(w in title_text for w in INCLUDE_NAVER) and any(
+                w in title_text for w in MATCH_NAVER
+            )
 
+            # 키워드 조건에 일치하는 신규 글이 발견된 경우
+            if is_toss_valid or is_naver_valid:
+                post_url = f"https://m.ppomppu.co.kr/new/bbs_view.php?id=coupon&no={post_no}"
+                
+                # 📄 본문 내용 추출 (신규 알림 대상일 때만 1회 호출)
+                time.sleep(0.5)
+                content_text = get_detail_content(post_url)
 
-def main():
-    print("=== 뽐뿌 크롤러 시작 (GCP 프록시 우회 모드) ===")
+                category = "🚨 " if is_toss_valid else "💚 "
 
-    # 1. 첫 실행 시 게시판을 읽어와서 기존 글 ID들을 초기 세팅
-    print("초기 게시글 목록을 수집합니다...")
-    html = get_html_with_proxy(TARGET_URL)
-    if html:
-        parse_and_notify(html)
-        print(f"초기 세팅 완료 (기존 글 {len(seen_post_ids)}개 등록됨)")
+                # 📌 [제목 + 본문 내용 + 링크] 메시지 생성
+                alert_msg = (
+                    f"{category}{title_text}\n\n"
+                    f"📄 본문:\n{content_text.strip()}\n\n"
+                    f"🔗 링크: {post_url}"
+                )
 
-    # 2. 루프를 돌며 주기적으로 크롤링 (예: 30초 간격)
-    while True:
-        try:
-            time.sleep(30)
-            print("\n[주기적 수집 시도]")
-            html = get_html_with_proxy(TARGET_URL)
-            if html:
-                parse_and_notify(html)
-        except KeyboardInterrupt:
-            print("\n크롤러를 종료합니다.")
-            break
-        except Exception as e:
-            print(f"[메인 루프 에러] {e}")
+                send_telegram_message(alert_msg)
+                logger.info(f"📢 [신규 알림 발송] {title_text}")
+
+                # 발송 완료 목록에 추가
+                sent_posts.append(post_no)
+                db_updated = True
+                time.sleep(1.0)
+
+        # 새로운 발송 건이 있으면 DB 저장
+        if db_updated:
+            save_sent_posts(sent_posts)
+
+    except Exception as e:
+        logger.error(f"❌ 크롤링 중 에러 발생: {e}")
 
 
 if __name__ == "__main__":
-    main()
+    logger.info("🚀 10분 모니터링 스캔 시작 (약 1분 간격으로 안전 스캔)")
+    
+    start_time = time.time()
+    attempt = 1
+
+    # 10분(600초) 동안 약 50~70초 사이의 랜덤 간격으로 모니터링
+    while time.time() - start_time < 600:
+        logger.info(f"🕵️‍♂️ [{attempt} 번째 스캔 중...]")
+        check_ppomppu_coupon()
+        
+        next_sleep = random.uniform(50.0, 70.0)
+        
+        if (time.time() - start_time) + next_sleep >= 600:
+            break
+
+        logger.info(f"⏳ {next_sleep:.1f}초 대기 후 다음 스캔...")
+        time.sleep(next_sleep)
+        attempt += 1
+
+    logger.info("✅ 10분 모니터링 스캔 완료. 작업을 마칩니다.")
