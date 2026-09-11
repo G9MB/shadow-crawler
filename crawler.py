@@ -13,16 +13,19 @@ load_dotenv()
 # ================================================================= #
 # ⭐ [유저 설정 구역] 
 # ================================================================= #
-# 1. 퀴즈 감지 키워드
-QUIZ_START_KEYWORDS = ["토퀴"]  # 퀴즈 시작 알림용 키워드
+# 1. 퀴즈 감지 키워드 (세션 시작용)
+QUIZ_START_KEYWORDS = ["토퀴", "토스퀴즈", "토스 퀴즈"]
 
-# 2. 파일 경로
+# 2. 제외 키워드 (정답 업데이트에서 완전 무시할 단어)
+EXCLUDE_KEYWORDS = ["감사", "고맙", "수고", "종료", "마감", "출석", "출첵"]
+
+# 3. 파일 경로
 LOG_FILE_PATH = "/home/swkim/shadow-crawler/chat_crawler.log"
 
-# 3. 채팅 서버 주소
+# 4. 채팅 서버 주소
 SOCKET_URL = "https://luckyquizchat.duckdns.org"
 
-# 4. 퀴즈 세션 유지 시간 (초) - 예: 600초 = 10분 동안 올라오는 정답 채집
+# 5. 퀴즈 세션 유지 시간 (초) - 600초 = 10분
 SESSION_TIMEOUT = 600
 # ================================================================= #
 
@@ -54,17 +57,6 @@ sio = socketio.Client(
     engineio_logger=False
 )
 
-# ================================================================= #
-# 🧠 실시간 퀴즈 세션 메모리 관리
-# active_session = {
-#     "telegram_msg_id": 12345,
-#     "start_time": 1710000000,
-#     "title_user": "작성자",
-#     "title_text": "토퀴 시작",
-#     "answers": ["123", "456"], # 감지된 정답 목록
-#     "raw_history": []          # 발송 내역 중복 방지
-# }
-# ================================================================= #
 active_session = None
 
 
@@ -102,18 +94,29 @@ def edit_telegram_message(msg_id, text):
 
 
 def is_potential_answer(text):
-    """단순 수다와 정답/숫자 제보 구분 로직"""
-    # 1. 숫자 포함 여부 (퀴즈 정답은 대부분 숫자를 포함)
-    has_digit = bool(re.search(r"\d", text))
-    
-    # 2. 정답 관련 단어 포함 여부
-    ans_keywords = ["정답", "답", "ㅂ", "ㄷ", "임", "인듯", "같음", "확인"]
+    """정답 및 후속 정보 채집 조건 검사"""
+    # 1. 제외 단어("감사" 등)가 들어가면 정답 후보에서 즉시 탈락
+    if any(ex in text for ex in EXCLUDE_KEYWORDS):
+        return False
+
+    # 2. 정답 제보성 어휘 패턴
+    ans_keywords = [
+        "정답", "답", "ㅂ", "ㄷ", "임", "인듯", "같음", "확인", 
+        "맞음", "맞나", "아님", "수정", "바뀜", "대문자", "소문자", "띄어쓰기"
+    ]
     has_ans_kw = any(kw in text for kw in ans_keywords)
+    
+    # 3. 숫자가 포함된 단답형
+    has_digit = bool(re.search(r"\d", text))
 
-    # 3. 너무 긴 수다글(40자 이상)은 제외
-    is_short = len(text) <= 40
+    # 4. 문자열 길이 (너무 긴 잡담 문장은 제외, 보통 정답이나 힌트는 35자 이내)
+    is_short = len(text) <= 35
 
-    return (has_digit or has_ans_kw) and is_short
+    # [최종 조건] 짧은 단문이면서 (숫자 포함 OR 정답 관련 키워드 포함 OR 단답형 한글/영어 정답)
+    # 단답형(15자 이하)은 키워드가 없더라도 숫자나 글자 자체를 정답으로 간주하여 수집
+    is_very_short_answer = len(text) <= 15
+
+    return is_short and (has_digit or has_ans_kw or is_very_short_answer)
 
 
 @sio.event
@@ -146,22 +149,21 @@ def catch_all(event_name, *args):
         now = time.time()
 
         # -------------------------------------------------------------
-        # 1. 세션 만료 체크 (설정 시간이 지나면 활성 세션 종료)
+        # 1. 세션 만료 체크
         # -------------------------------------------------------------
         if active_session and (now - active_session["start_time"] > SESSION_TIMEOUT):
             logger.info("⏰ 퀴즈 세션이 만료되었습니다. 다음 토퀴를 대기합니다.")
             active_session = None
 
         # -------------------------------------------------------------
-        # 2. '토퀴' 키워드 감지 -> 새로운 퀴즈 세션 생성 및 알림 발송
+        # 2. '토퀴' 키워드 감지 -> 새로운 퀴즈 세션 생성
         # -------------------------------------------------------------
         if any(kw in msg_text for kw in QUIZ_START_KEYWORDS):
-            # 이전 세션이 있더라도 새 토퀴가 오면 세션 새로 교체
             initial_text = (
                 f"🚨 <b>[토퀴 퀴즈 제보 발생!]</b>\n\n"
                 f"👤 작성자: {user_name}\n"
                 f"💬 내용: {msg_text}\n\n"
-                f"⏳ <i>후속 정답 채팅을 감시 중입니다...</i>"
+                f"⏳ <i>후속 정답/힌트 채팅을 감시 중입니다...</i>"
             )
             msg_id = send_telegram_message(initial_text)
 
@@ -178,19 +180,18 @@ def catch_all(event_name, *args):
             return
 
         # -------------------------------------------------------------
-        # 3. 활성 세션 진행 중일 때 후속 정답 채팅 감지 및 메시지 수정
+        # 3. 활성 세션 중 후속 정답 감지 및 메시지 수정
         # -------------------------------------------------------------
         if active_session:
             # 중복 채팅 스킵
             if msg_text in active_session["raw_history"]:
                 return
 
-            # 정답 후보 메시지인지 필터링
+            # 정답/힌트 후보 필터링 ("감사" 등 제외 단어 필터 포함)
             if is_potential_answer(msg_text):
                 active_session["raw_history"].append(msg_text)
                 active_session["answers"].append(f"• <b>{user_name}</b>: {msg_text}")
 
-                # 정답 목록 텍스트 조립
                 answers_formatted = "\n".join(active_session["answers"])
 
                 updated_text = (
@@ -203,7 +204,6 @@ def catch_all(event_name, *args):
                     f"🔄 <i>실시간 업데이트 중... ({int((SESSION_TIMEOUT - (now - active_session['start_time']))//60)}분 남음)</i>"
                 )
 
-                # 기존 텔레그램 메시지 수정 발송
                 edit_telegram_message(active_session["telegram_msg_id"], updated_text)
                 logger.info(f"✏️ [텔레그램 메세지 수정 완료] 추가된 내용: ({user_name}) {msg_text}")
 
