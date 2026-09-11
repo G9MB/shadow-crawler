@@ -145,7 +145,7 @@ def catch_all(event_name, *args):
 
         if not msg_text:
             return
-
+        logger.info(f" [수신된 채팅] {user_name}:{msg_text}")
         now = time.time()
 
         # -------------------------------------------------------------
