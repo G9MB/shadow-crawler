@@ -1,44 +1,46 @@
 import os
+import time
+import re
+import json
+import logging
+from logging.handlers import TimedRotatingFileHandler
+import requests
+import socketio
 from dotenv import load_dotenv
 
 load_dotenv()
-import requests
-from bs4 import BeautifulSoup
-import time
-import re
-import random
-import logging
-from logging.handlers import TimedRotatingFileHandler
-import json
-from datetime import datetime
 
 # ================================================================= #
-# ⭐ [유저 설정 구역] Cloudflare Worker 및 크롤링 옵션
+# ⭐ [유저 설정 구역] 
 # ================================================================= #
-# 0. Cloudflare Worker URL (본인의 서브도메인 주소로 변경하세요)
-WORKER_URL = "https://wispy-sky-61bb.gohanbit22.workers.dev"
+# 1. 감시할 키워드 (포함할 단어 / 제외할 단어)
+INCLUDE_KEYWORDS = ["토퀴"]
+EXCLUDE_KEYWORDS = ["종료", "마감"]
 
-# 1. 토스 관련 키워드 (포함할 단어 / 제외할 단어)
-INCLUDE_TOSS = ["토스"]
-EXCLUDE_TOSS = ["토스트", "알바"]
+# 2. 파일 경로 설정 (크론탭/배포 환경 절대 경로)
+LOG_FILE_PATH = "/home/swkim/shadow-crawler/chat_crawler.log"
+DB_FILE = "/home/swkim/shadow-crawler/sent_chats.txt"
 
-# 2. 네이버 페이 관련 키워드 (기본 포함 단어 / 매칭될 필수 단어)
-INCLUDE_NAVER = ["네이버"]
-MATCH_NAVER = ["180", "100", "120"]
-
-# 3. 파일 경로 설정 (크론탭 환경 대응 절대 경로)
-LOG_FILE_PATH = "/home/swkim/shadow-crawler/crawler.log"
-DB_FILE = "/home/swkim/shadow-crawler/sent_posts.txt"
+# 3. 채팅 서버 주소 및 파라미터
+SOCKET_URL = "https://luckyquizchat.duckdns.org"
+SOCKET_PARAMS = {
+    "clientRef": "https://luckyquiz3.blogspot.com/",
+    "inIframe": "true",
+    "EIO": "4",
+    "transport": "websocket"
+}
 # ================================================================= #
 
 # 로그 시스템 설정
-logger = logging.getLogger("CrawlerLogger")
+logger = logging.getLogger("ChatCrawlerLogger")
 logger.setLevel(logging.INFO)
+
+# 로그 파일 생성 디렉토리 체크
+os.makedirs(os.path.dirname(LOG_FILE_PATH), exist_ok=True)
 
 log_handler = TimedRotatingFileHandler(
     filename=LOG_FILE_PATH, when="midnight", interval=1, backupCount=1, encoding="utf-8"
 )
-
 formatter = logging.Formatter(
     "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
 )
@@ -52,9 +54,18 @@ logger.addHandler(stream_handler)
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+# Socket.IO 클라이언트 생성 (자동 재연결 설정)
+sio = socketio.Client(
+    reconnection=True, 
+    reconnection_attempts=0, # 무한 재시도
+    reconnection_delay=3,
+    logger=False,
+    engineio_logger=False
+)
 
-def load_sent_posts():
-    """파일에서 이미 발송한 글번호 리스트 [ "1234", "1235" ] 구조를 읽어옵니다."""
+
+def load_sent_chats():
+    """발송한 메시지 식별자/내용 중복 체크용 로드"""
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, "r", encoding="utf-8") as f:
@@ -62,15 +73,15 @@ def load_sent_posts():
                 if content:
                     return json.loads(content)
         except Exception as e:
-            logger.error(f"❌ DB 파일 읽기 실패 (새로 생성합니다): {e}")
+            logger.error(f"❌ DB 파일 읽기 실패: {e}")
     return []
 
 
-def save_sent_posts(posts_list):
-    """발송 완료된 글번호 리스트를 JSON 형태로 파일에 저장합니다."""
+def save_sent_chats(chats_list):
+    """발송한 메시지 식별자/내용 중복 저장"""
     try:
         with open(DB_FILE, "w", encoding="utf-8") as f:
-            json.dump(posts_list, f, ensure_ascii=False, indent=2)
+            json.dump(chats_list, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"❌ DB 파일 저장 실패: {e}")
 
@@ -82,169 +93,113 @@ def send_telegram_message(text):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text}
     try:
-        requests.post(url, json=payload)
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
         logger.error(f"❌ 텔레그램 발송 에러: {e}")
 
 
-def fetch_via_worker(target_url):
-    """Cloudflare Worker 프록시를 거쳐 대상 웹페이지 HTML을 안전하게 받아옵니다."""
+# ================================================================= #
+# Socket.IO 이벤트 핸들러
+# ================================================================= #
+@sio.event
+def connect():
+    logger.info("✅ luckyquizchat 웹소켓 서버에 성공적으로 연결되었습니다.")
+
+
+@sio.event
+def disconnect():
+    logger.warning("⚠️ 서버와 웹소켓 연결이 끊어졌습니다. 자동 재연결을 시도합니다...")
+
+
+@sio.event
+def connect_error(data):
+    logger.error(f"❌ 웹소켓 연결 실패: {data}")
+
+
+# 모든 수신 이벤트를 포착하는 와일드카드 핸들러
+@sio.on("*")
+def catch_all(event_name, *args):
     try:
-        proxy_url = f"{WORKER_URL}?target={target_url}"
-        response = requests.get(proxy_url, timeout=15)
+        sent_chats = load_sent_chats()
         
-        if response.status_code == 200:
-            return response.content.decode("euc-kr", errors="replace")
-        else:
-            logger.error(f"❌ Worker 응답 에러 (Status: {response.status_code})")
-            return None
-    except Exception as e:
-        logger.error(f"❌ Worker 중계 요청 실패: {e}")
-        return None
+        # 데이터 구조 추출
+        data = args[0] if args else {}
+        
+        msg_text = ""
+        user_name = "익명"
+        msg_id = ""
 
+        if isinstance(data, dict):
+            msg_text = str(data.get("msg") or data.get("text") or data.get("message") or "").strip()
+            user_name = str(data.get("name") or data.get("user") or data.get("nickname") or "익명").strip()
+            msg_id = str(data.get("id") or data.get("_id") or "")
+        elif isinstance(data, str):
+            msg_text = data.strip()
 
-def get_detail_content(post_url):
-    """게시글 상세 페이지에서 본문 내용만 추출합니다 (댓글 제외)."""
-    try:
-        html_text = fetch_via_worker(post_url)
-        if not html_text:
-            return "본문 페이지 접속 실패"
+        if not msg_text:
+            return
 
-        soup = BeautifulSoup(html_text, "html.parser")
-        content_div = soup.select_one(
-            ".board-contents, .pic_bg, .bbs_view_content, .cont"
+        # 메시지 고유 식별값 (ID가 없으면 '작성자+내용'으로 생성)
+        chat_identifier = msg_id if msg_id else f"{user_name}:{msg_text}"
+
+        # 이미 발송된 메시지면 스킵
+        if chat_identifier in sent_chats:
+            return
+
+        # [키워드 검사]
+        is_valid = any(kw in msg_text for kw in INCLUDE_KEYWORDS) and not any(
+            ex in msg_text for ex in EXCLUDE_KEYWORDS
         )
 
-        if not content_div:
-            content_div = soup.select_one("#mainContent")
+        if is_valid:
+            alert_msg = (
+                f"💬 [채팅 실시간 키워드 감지]\n\n"
+                f"👤 작성자: {user_name}\n"
+                f"💬 내용: {msg_text}\n\n"
+                f"🔗 출처: https://luckyquiz3.blogspot.com/"
+            )
 
-        content_text = (
-            content_div.get_text().strip()
-            if content_div
-            else "본문 내용을 파싱할 수 없는 구조입니다."
-        )
-        content_text = re.sub(r"\n+", "\n", content_text)
-        
-        # 본문이 너무 길면 200자로 자르고 생략 표시
-        if len(content_text) > 200:
-            content_text = content_text[:200] + "...(지면상 생략)"
+            send_telegram_message(alert_msg)
+            logger.info(f"📢 [신규 채팅 알림 발송] ({user_name}) {msg_text}")
 
-        return content_text
+            # DB에 저장 (최근 500개만 유지)
+            sent_chats.append(chat_identifier)
+            if len(sent_chats) > 500:
+                sent_chats = sent_chats[-500:]
+            save_sent_chats(sent_chats)
+
     except Exception as e:
-        logger.error(f"❌ 상세 페이지 본문 분석 에러: {e}")
-        return "본문 로딩 실패"
+        logger.error(f"❌ 이벤트({event_name}) 처리 중 에러: {e}")
 
 
-def check_ppomppu_coupon():
-    sent_posts = load_sent_posts()  # 이미 보낸 글번호 리스트
-    db_updated = False
-
-    target_list_url = "https://m.ppomppu.co.kr/new/bbs_list.php?id=coupon&extref=1"
+# ================================================================= #
+# 실행 구역
+# ================================================================= #
+def start_crawler():
+    logger.info("🚀 luckyquizchat 실시간 웹소켓 크롤러 시작")
     
-    # Cloudflare Worker를 통하여 쿠폰 게시판 목록 가져오기
-    html_text = fetch_via_worker(target_list_url)
-    if not html_text:
-        logger.error("❌ 뽐뿌 목록 페이지 수집 실패")
-        return
+    # HTTP 헤더 설정 (Referer 필수)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+        "Referer": "https://luckyquiz3.blogspot.com/"
+    }
 
-    try:
-        soup = BeautifulSoup(html_text, "html.parser")
-        titles = soup.select("a.title_a, a.list_title, span.title, td.title a")
-
-        if len(titles) == 0:
-            titles = [
-                a for a in soup.find_all("a") if "bbs_view.php" in a.get("href", "")
-            ]
-
-        logger.info(f"🔄 게시글 {len(titles)}개 스캔 중...")
-
-        for item in titles:
-            raw_text = item.get_text().strip()
-            if not raw_text:
-                continue
-
-            lines = [line.strip() for line in raw_text.split("\n") if line.strip()]
-            if not lines:
-                continue
-            title_text = lines[0]
-            title_text = re.sub(r"\s+", " ", title_text)
-
-            if not title_text or len(title_text) < 3:
-                continue
-
-            raw_href = item.get("href", "")
-            if not raw_href:
-                continue
-
-            no_match = re.search(r"no=(\d+)", raw_href)
-            if not no_match:
-                continue
-
-            post_no = no_match.group(1)
-
-            # 🎯 이미 보낸 글이면 스킵
-            if post_no in sent_posts:
-                continue
-
-            # [조건] 제목 키워드 검사
-            is_toss_valid = any(w in title_text for w in INCLUDE_TOSS) and not any(
-                w in title_text for w in EXCLUDE_TOSS
-            )
-            is_naver_valid = any(w in title_text for w in INCLUDE_NAVER) and any(
-                w in title_text for w in MATCH_NAVER
-            )
-
-            # 키워드 조건에 일치하는 신규 글이 발견된 경우
-            if is_toss_valid or is_naver_valid:
-                post_url = f"https://m.ppomppu.co.kr/new/bbs_view.php?id=coupon&no={post_no}"
-                
-                # 📄 본문 내용 추출 (신규 알림 대상일 때만 1회 호출)
-                time.sleep(0.5)
-                content_text = get_detail_content(post_url)
-
-                category = "🚨 " if is_toss_valid else "💚 "
-
-                # 📌 [제목 + 본문 내용 + 링크] 메시지 생성
-                alert_msg = (
-                    f"{category}{title_text}\n\n"
-                    f"📄 본문:\n{content_text.strip()}\n\n"
-                    f"🔗 링크: {post_url}"
+    while True:
+        try:
+            if not sio.connected:
+                # 쿼리 파라미터 및 헤더 전달하며 접속
+                sio.connect(
+                    SOCKET_URL,
+                    socketio_path="socket.io",
+                    headers=headers,
+                    transports=["websocket", "polling"],
+                    wait_timeout=10
                 )
-
-                send_telegram_message(alert_msg)
-                logger.info(f"📢 [신규 알림 발송] {title_text}")
-
-                # 발송 완료 목록에 추가
-                sent_posts.append(post_no)
-                db_updated = True
-                time.sleep(1.0)
-
-        # 새로운 발송 건이 있으면 DB 저장
-        if db_updated:
-            save_sent_posts(sent_posts)
-
-    except Exception as e:
-        logger.error(f"❌ 크롤링 중 에러 발생: {e}")
+                sio.wait()  # 프로세스가 종료되지 않고 계속 수신 대기
+        except Exception as e:
+            logger.error(f"❌ 소켓 서버 연결 중 예외 발생: {e}")
+            time.sleep(5)  # 5초 후 재접속 시도
 
 
 if __name__ == "__main__":
-    logger.info("🚀 10분 모니터링 스캔 시작 (약 1분 간격으로 안전 스캔)")
-    
-    start_time = time.time()
-    attempt = 1
-
-    # 10분(600초) 동안 약 50~70초 사이의 랜덤 간격으로 모니터링
-    while time.time() - start_time < 600:
-        logger.info(f"🕵️‍♂️ [{attempt} 번째 스캔 중...]")
-        check_ppomppu_coupon()
-        
-        next_sleep = random.uniform(50.0, 70.0)
-        
-        if (time.time() - start_time) + next_sleep >= 600:
-            break
-
-        logger.info(f"⏳ {next_sleep:.1f}초 대기 후 다음 스캔...")
-        time.sleep(next_sleep)
-        attempt += 1
-
-    logger.info("✅ 10분 모니터링 스캔 완료. 작업을 마칩니다.")
+    start_crawler()
