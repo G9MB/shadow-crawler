@@ -131,17 +131,14 @@ def extract_answer(content):
 # 5. 실시간 텔레그램 렌더링 및 마감 처리
 # ==========================================
 def build_message_text(status_header, answers_list, start_time):
-    """텔레그램 텍스트 생성"""
-    lines = [f"{status_header}\n"]
+    """텔레그램 텍스트 생성 (양식 수정 반영)"""
+    lines = [status_header]
     if not answers_list:
         lines.append("⏳ <i>정답 수집 중... (제보 대기)</i>")
     else:
-        lines.append("<b>📝 올라온 정답 목록:</b>")
         for ans in answers_list:
             lines.append(f"• <b>{ans}</b>")
     
-    start_str = datetime.fromtimestamp(start_time).strftime('%H:%M:%S')
-    lines.append(f"\n⏱️ 수집 시작: {start_str} (5분간 자동 업데이트)")
     return "\n".join(lines)
 
 def finish_quiz_collection():
@@ -152,7 +149,7 @@ def finish_quiz_collection():
         answers = list(quiz_state.answers)
         start_time = quiz_state.start_time
     
-    final_text = build_message_text("✅ <b>[토스 퀴즈 수집 마감 (5분 경과)]</b>", answers, start_time)
+    final_text = build_message_text("✅ <b>[토스 퀴즈 수집 마감]</b>", answers, start_time)
     edit_telegram_msg(msg_id, final_text)
     print("⏰ [타이머 마감] 5분 퀴즈 정답 수집이 마감되었습니다.")
 
