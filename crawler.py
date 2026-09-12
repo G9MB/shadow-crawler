@@ -86,31 +86,42 @@ def format_time(ts):
     except Exception:
         return str(ts)
 
+# 접두어 정규식
 PREFIX_PATTERN = re.compile(
     r'^(토스\s*퀴즈\s*정답|토스\s*정답|토퀴\s*정답|퀴즈\s*정답|퀴즈\s*답|토퀴\s*답|정답|토퀴|답)[:\s=\-]*',
     re.IGNORECASE
 )
+
+# 절대 정답으로 인정하지 않을 제외 단어 리스트
+EXCLUDE_WORDS = ["토퀴", "토스퀴즈", "토스 퀴즈", "안녕", "안녕하세요", "반가워", "반갑습니다"]
 
 def extract_answer(content):
     """정답 후보 추출 로직"""
     if not content:
         return None
 
-    # 인사말/감사 표현 스킵
+    # 1) 인사말/감사 표현 스킵
     if any(keyword in content for keyword in ["감사", "고맙"]):
         return None
 
     text = content.strip()
 
-    # 1) 접두어가 붙은 경우 ("정답 1234", "토퀴 5678" 등)
+    # 2) 단순 트리거 단어나 인사말 단독 언급은 완전 스킵
+    if text in EXCLUDE_WORDS:
+        return None
+
+    # 3) 접두어가 붙은 경우 ("정답 1234", "퀴즈답 세탁기" 등)
     match = PREFIX_PATTERN.search(text)
     if match:
         extracted = text[match.end():].strip()
         extracted = extracted.split('\n')[0].strip()
-        if extracted and len(extracted) <= 10:
+        
+        # 접두어 제거 후 남은 단어가 10자 이하이고 제외 단어가 아닌 경우
+        if extracted and len(extracted) <= 10 and extracted not in EXCLUDE_WORDS:
             return extracted
+        return None
 
-    # 2) 접두어 없이 단독 언급 (10자 이하)
+    # 4) 접두어 없이 단독 언급 (10자 이하)
     if len(text) <= 10 and not text.startswith("http") and not re.match(r'^(ㅋ|ㅎ|ㅠ|ㅜ)+$', text):
         return text
 
@@ -120,7 +131,7 @@ def extract_answer(content):
 # 5. 실시간 텔레그램 렌더링 및 마감 처리
 # ==========================================
 def build_message_text(status_header, answers_list, start_time):
-    """락 없이 텍스트 전용 생성"""
+    """텔레그램 텍스트 생성"""
     lines = [f"{status_header}\n"]
     if not answers_list:
         lines.append("⏳ <i>정답 수집 중... (제보 대기)</i>")
