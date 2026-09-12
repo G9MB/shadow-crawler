@@ -24,7 +24,8 @@ class QuizState:
         self.is_active = False
         self.start_time = 0
         self.telegram_msg_id = None
-        self.answer_counts = {}  # {"정답후보": 언급횟수}
+        self.last_sent_text = ""
+        self.answers = []  # 순서대로 저장할 정답 리스트 (중복 제외)
         self.timer = None
         self.lock = threading.Lock()
 
@@ -54,7 +55,12 @@ def edit_telegram_msg(msg_id, text):
     """기존 텔레그램 메시지 실시간 수정"""
     if not msg_id or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
-        
+
+    with quiz_state.lock:
+        if quiz_state.last_sent_text == text:
+            return  # 내용 변화 없으면 API 호출하지 않음
+        quiz_state.last_sent_text = text
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -83,7 +89,6 @@ def format_time(ts):
     except Exception:
         return str(ts)
 
-# 접두어 정규식 (긴 패턴 우선 매칭)
 PREFIX_PATTERN = re.compile(
     r'^(토스\s*퀴즈\s*정답|토스\s*정답|토퀴\s*정답|퀴즈\s*정답|퀴즈\s*답|토퀴\s*답|정답|토퀴|답)[:\s=\-]*',
     re.IGNORECASE
@@ -100,7 +105,7 @@ def extract_answer(content):
 
     text = content.strip()
 
-    # 1) '정답', '토퀴' 등의 접두어가 붙은 경우
+    # 1) 접두어가 붙은 경우 ("정답 1234", "토퀴 5678" 등)
     match = PREFIX_PATTERN.search(text)
     if match:
         extracted = text[match.end():].strip()
@@ -108,8 +113,7 @@ def extract_answer(content):
         if extracted and len(extracted) <= 10:
             return extracted
 
-    # 2) 접두어 없이 정답만 언급한 경우 (단독 메시지 10글자 이하)
-    # 단독 ㅋ,ㅎ,ㅠ,ㅜ 및 URL, 단순 질문형 문장 제외
+    # 2) 접두어 없이 단독 언급 (10자 이하)
     if len(text) <= 10 and not text.startswith("http") and not re.match(r'^(ㅋ|ㅎ|ㅠ|ㅜ)+$', text):
         return text
 
@@ -118,25 +122,24 @@ def extract_answer(content):
 # ==========================================
 # 5. 실시간 텔레그램 렌더링 및 마감 처리
 # ==========================================
-def render_quiz_message(status_header="🚨 <b>[토스 퀴즈 실시간 집계]</b>"):
-    """집계된 정답 리스트 텔레그램 텍스트 생성"""
+def render_quiz_message(status_header="🚨 <b>[토스 퀴즈 감지!]</b>"):
+    """수집된 정답 목록 텔레그램 텍스트 생성"""
     with quiz_state.lock:
-        sorted_answers = sorted(quiz_state.answer_counts.items(), key=lambda x: x[1], reverse=True)
-        
         lines = [f"{status_header}\n"]
-        if not sorted_answers:
+        
+        if not quiz_state.answers:
             lines.append("⏳ <i>정답 수집 중... (제보 대기)</i>")
         else:
-            lines.append("<b>📊 실시간 집계된 정답 후보:</b>")
-            for ans, count in sorted_answers[:7]:  # 상위 7개 표출
-                lines.append(f"• <b>{ans}</b> ({count}회 언급)")
+            lines.append("<b>📝 올라온 정답 목록:</b>")
+            for ans in quiz_state.answers:
+                lines.append(f"• <b>{ans}</b>")
         
         start_str = datetime.fromtimestamp(quiz_state.start_time).strftime('%H:%M:%S')
-        lines.append(f"\n⏱️ 수집 시작: {start_str} (5분간 실시간 업데이트)")
+        lines.append(f"\n⏱️ 수집 시작: {start_str} (5분간 자동 업데이트)")
         return "\n".join(lines)
 
 def finish_quiz_collection():
-    """5분 만료 시 수집 종료 마감"""
+    """5분 만료 시 수집 종료"""
     with quiz_state.lock:
         quiz_state.is_active = False
         msg_id = quiz_state.telegram_msg_id
@@ -152,7 +155,7 @@ def finish_quiz_collection():
 def connect():
     print(f"✅ [소켓 연결 완료] '{BOT_NICKNAME}' 로 참가 등록(join) 전송...")
     sio.emit("join", {"nick": BOT_NICKNAME, "deviceId": DEVICE_ID})
-    print("🚀 [모니터링 시작] 퀴즈 키워드(토퀴/토스 퀴즈) 수신 대기 중...\n" + "="*50)
+    print("🚀 [모니터링 시작] 퀴즈 키워드 수신 대기 중...\n" + "="*50)
 
 @sio.on("new_msg")
 def on_new_message(data):
@@ -166,36 +169,33 @@ def on_new_message(data):
     # 터미널 실시간 출력
     print(f"💬 [{time_str}] {nick}: {content}")
 
-    # --------------------------------------------------
     # 1. 퀴즈 트리거 감지 (토퀴 / 토스 퀴즈 / 토스퀴즈)
-    # --------------------------------------------------
     is_quiz_trigger = any(kw in content for kw in ["토퀴", "토스 퀴즈", "토스퀴즈"])
     
     if is_quiz_trigger:
         with quiz_state.lock:
             now = time.time()
-            # 마지막 감지 후 3분 이내 연속 키워드는 동일 퀴즈로 간주
+            # 3분 이내 연속 키워드는 동일 퀴즈로 처리
             if not quiz_state.is_active or (now - quiz_state.start_time > 180):
                 if quiz_state.timer:
                     quiz_state.timer.cancel()
                 
                 quiz_state.is_active = True
                 quiz_state.start_time = now
-                quiz_state.answer_counts.clear()
+                quiz_state.answers.clear()
+                quiz_state.last_sent_text = ""
                 
-                # 닉네임 표시 제거된 깔끔한 초기 메시지 발송
-                initial_text = f"🚨 <b>[토스 퀴즈 감지!]</b>\n<b>내용:</b> {content}\n\n⏳ <i>실시간 정답 수집을 시작합니다...</i>"
+                initial_text = render_quiz_message("🚨 <b>[토스 퀴즈 감지!]</b>")
                 quiz_state.telegram_msg_id = send_telegram_msg(initial_text)
+                quiz_state.last_sent_text = initial_text
                 
                 # 5분(300초) 타이머 시작
                 quiz_state.timer = threading.Timer(300.0, finish_quiz_collection)
                 quiz_state.timer.start()
                 
-                print(f"🚨 [퀴즈 트리거 감지] 5분 정답 수집 모드 시작 (Msg ID: {quiz_state.telegram_msg_id})")
+                print(f"🚨 [퀴즈 감지] 5분 정답 수집 시작 (Msg ID: {quiz_state.telegram_msg_id})")
 
-    # --------------------------------------------------
-    # 2. 5분 수집 기간 동안 모든 메시지 실시간 정답 추출 및 수정
-    # --------------------------------------------------
+    # 2. 5분 동안 채팅창에 새 정답이 올라오면 리스트에 추가 후 텔레그램 수정
     with quiz_state.lock:
         is_active = quiz_state.is_active
         msg_id = quiz_state.telegram_msg_id
@@ -204,12 +204,12 @@ def on_new_message(data):
         candidate = extract_answer(content)
         if candidate:
             with quiz_state.lock:
-                quiz_state.answer_counts[candidate] = quiz_state.answer_counts.get(candidate, 0) + 1
-                updated_text = render_quiz_message()
-            
-            # 실시간 텔레그램 메시지 편집 수정
-            edit_telegram_msg(msg_id, updated_text)
-            print(f"🎯 [실시간 정답 반영] '{candidate}' (총 {quiz_state.answer_counts[candidate]}회)")
+                # 새로운 정답인 경우에만 추가 (중복 방지)
+                if candidate not in quiz_state.answers:
+                    quiz_state.answers.append(candidate)
+                    updated_text = render_quiz_message()
+                    edit_telegram_msg(msg_id, updated_text)
+                    print(f"🎯 [새 정답 추가] '{candidate}'")
 
 @sio.on("*")
 def catch_all(event_name, *args):
