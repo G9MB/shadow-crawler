@@ -86,13 +86,13 @@ def format_time(ts):
     except Exception:
         return str(ts)
 
-# 제거할 접두어 패턴 (토스 퀴즈, 토스퀴즈, 토퀴, 토스, 정답, 퀴즈정답 등)
+# 제거할 접두어 패턴
 PREFIX_PATTERN = re.compile(
     r'^(토스\s*퀴즈\s*정답|토스\s*정답|토퀴\s*정답|퀴즈\s*정답|퀴즈\s*답|토퀴\s*답|토스\s*퀴즈|토스퀴즈|토퀴|토스|정답|답)[:\s=\-]*',
     re.IGNORECASE
 )
 
-# 제외할 단어 및 키워드 리스트
+# 제외할 키워드 및 완전 일치 제외 단어
 EXCLUDE_KEYWORDS = ["감사", "고맙", "있어요", "있음", "나옴", "시작", "안녕", "반가"]
 EXCLUDE_EXACT = ["토퀴", "토스퀴즈", "토스 퀴즈", "토스", "정답", "답"]
 
@@ -101,7 +101,7 @@ def extract_answer(content):
     if not content:
         return None
 
-    # 1) 인사/감사/상태 제보 키워드 포함 시 스킵 (예: 토퀴 있어요, 정답 있음)
+    # 1) 감사/인사/상태 제보 키워드 포함 시 스킵 (예: 토퀴 감사합니다~~)
     if any(keyword in content for keyword in EXCLUDE_KEYWORDS):
         return None
 
@@ -175,6 +175,12 @@ def on_new_message(data):
     print(f"💬 [{time_str}] {nick}: {content}")
 
     # --------------------------------------------------
+    # 0. 감사/인사 메시지는 무조건 스킵 (트리거/수집 모두 제외)
+    # --------------------------------------------------
+    if any(kw in content for kw in ["감사", "고맙"]):
+        return
+
+    # --------------------------------------------------
     # 1. 퀴즈 트리거 감지 (토퀴 / 토스 퀴즈 / 토스퀴즈)
     # --------------------------------------------------
     is_quiz_trigger = any(kw in content for kw in ["토퀴", "토스 퀴즈", "토스퀴즈"])
@@ -184,7 +190,8 @@ def on_new_message(data):
         now = time.time()
 
         with quiz_state.lock:
-            if not quiz_state.is_active or (now - quiz_state.start_time > 180):
+            # 수집 중이 아닌 경우에만 새 트리거 메시지 발송 (진행 중 재트리거 금지)
+            if not quiz_state.is_active:
                 if quiz_state.timer:
                     quiz_state.timer.cancel()
                 
@@ -212,10 +219,10 @@ def on_new_message(data):
                 quiz_state.timer.start()
                 
             print(f"🚨 [퀴즈 감지] 5분 정답 수집 시작 (Msg ID: {msg_id})")
-            return  # 트리거 메시지 자체는 수집 처리 완료되었으므로 종료
+            return  # 트리거 세션 시작 후 해당 메시지 처리 완료
 
     # --------------------------------------------------
-    # 2. 5분 동안 채팅창에 새 정답이 올라오면 리스트 추가 및 수정
+    # 2. 5분 동안 채팅창에 새 정답이 올라오면 기존 메시지 수정
     # --------------------------------------------------
     with quiz_state.lock:
         is_active = quiz_state.is_active
