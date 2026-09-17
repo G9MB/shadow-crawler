@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import time
 import threading
 import requests
@@ -16,6 +17,9 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 BOT_NICKNAME = "희미한범고래"
 DEVICE_ID = f"dev_killerwhale_{int(time.time() * 1000)}"
 
+# 프로그램 시작 시각 기록 (재시작 시간 확인용)
+START_TIME_STR = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 # ==========================================
 # 2. 전역 상태 관리
 # ==========================================
@@ -25,7 +29,7 @@ class QuizState:
         self.start_time = 0
         self.telegram_msg_id = None
         self.last_sent_text = ""
-        self.answers = []  # 순서대로 저장할 정답 리스트 (중복 제외)
+        self.answers = []
         self.timer = None
         self.lock = threading.Lock()
 
@@ -71,7 +75,81 @@ def edit_telegram_msg(msg_id, text):
         print(f"⚠️ 텔레그램 수정 실패: {e}")
 
 # ==========================================
-# 4. 텍스트 정제 및 정답 검출 로직
+# 4. 텔레그램 메시지 감지 (상태 확인 및 재시작)
+# ==========================================
+def restart_program():
+    """크롤러 프로세스를 직접 셀프 재시작하는 함수"""
+    print("🔄 [텔레그램 명령] 크롤러를 재시작합니다...")
+    if quiz_state.timer:
+        quiz_state.timer.cancel()
+    try:
+        if sio.connected:
+            sio.disconnect()
+    except Exception:
+        pass
+    
+    time.sleep(1)
+    # 현재 실행 중인 파이썬 프로세스를 자기 자신으로 새로 덮어씌워 재실행
+    python = sys.executable
+    os.execl(python, python, *sys.argv)
+
+def poll_telegram_messages():
+    """텔레그램에서 명령어가 들어오는지 확인 후 상태 응답 및 재시작 처리"""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+
+    last_update_id = 0
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+
+    # 시작 시 과거 오프라인 메시지 무시
+    try:
+        res = requests.get(url, params={"timeout": 0, "offset": -1}, timeout=10).json()
+        if res.get("ok") and res.get("result"):
+            last_update_id = res["result"][-1]["update_id"]
+    except Exception:
+        pass
+
+    while True:
+        try:
+            params = {"timeout": 10, "offset": last_update_id + 1}
+            res = requests.get(url, params=params, timeout=15).json()
+
+            if res.get("ok") and res.get("result"):
+                for update in res["result"]:
+                    last_update_id = update["update_id"]
+                    msg = update.get("message") or update.get("channel_post")
+                    
+                    if not msg:
+                        continue
+
+                    text = msg.get("text", "").strip()
+
+                    # 1. 텔레그램 상태 확인 명령어 (/ping, ping, !상태, 상태 등)
+                    if text in ["/ping", "ping", "!상태", "!점검", "상태"]:
+                        now_str = datetime.now().strftime("%H:%M:%S")
+                        
+                        if sio.connected:
+                            status_msg = f"🟢 웹 채팅방 수신 정상 ({now_str})\n⏱️ 시작 일시: {START_TIME_STR}"
+                        else:
+                            status_msg = f"🔴 ⚠️ 웹 채팅방 연결 끊김 ({now_str})\n⏱️ 시작 일시: {START_TIME_STR}"
+                            
+                        send_telegram_msg(status_msg)
+                        print(f"🔔 [상태 확인 수신] 응답 발송 완료")
+
+                    # 2. 텔레그램 재시작 명령어 (/재시작, 재시작, !재시작)
+                    elif text in ["/재시작", "재시작", "!재시작", "리셋"]:
+                        send_telegram_msg("🔄 크롤러를 재시작합니다...")
+                        print("🔔 [텔레그램 명령어] 재시작 요청 수신")
+                        time.sleep(1)
+                        restart_program()
+
+        except Exception as e:
+            time.sleep(3)
+
+        time.sleep(1)
+
+# ==========================================
+# 5. 텍스트 정제 및 정답 검출 로직
 # ==========================================
 def clean_html(text):
     if not text:
@@ -86,53 +164,44 @@ def format_time(ts):
     except Exception:
         return str(ts)
 
-# 제거할 접두어 패턴
 PREFIX_PATTERN = re.compile(
     r'^(토스\s*퀴즈\s*정답|토스\s*정답|토퀴\s*정답|퀴즈\s*정답|퀴즈\s*답|토퀴\s*답|토스\s*퀴즈|토스퀴즈|토퀴|토스|정답|답)[:\s=\-]*',
     re.IGNORECASE
 )
 
-# 제외할 키워드 및 완전 일치 제외 단어
 EXCLUDE_KEYWORDS = ["감사", "고맙", "있어요", "있음", "나옴", "시작", "안녕", "반가"]
 EXCLUDE_EXACT = ["토퀴", "토스퀴즈", "토스 퀴즈", "토스", "정답", "답"]
 
 def extract_answer(content):
-    """정답 후보 추출 로직"""
     if not content:
         return None
 
-    # 1) 감사/인사/상태 제보 키워드 포함 시 스킵 (예: 토퀴 감사합니다~~)
     if any(keyword in content for keyword in EXCLUDE_KEYWORDS):
         return None
 
     text = content.strip()
 
-    # 2) 단순 트리거 단어 단독 언급 스킵
     if text in EXCLUDE_EXACT:
         return None
 
-    # 3) 접두어 제거 ("토스퀴즈   10", "토스 100" -> "10", "100")
     match = PREFIX_PATTERN.search(text)
     if match:
         extracted = text[match.end():].strip()
         extracted = extracted.split('\n')[0].strip()
         
-        # 유효한 정답 후보인지 확인 (10자 이하, 제외 단어 아님)
         if extracted and len(extracted) <= 10 and extracted not in EXCLUDE_EXACT:
             return extracted
         return None
 
-    # 4) 접두어 없이 단독 언급된 정답 ("100", "세탁기" 등 10자 이하)
     if len(text) <= 10 and not text.startswith("http") and not re.match(r'^(ㅋ|ㅎ|ㅠ|ㅜ)+$', text):
         return text
 
     return None
 
 # ==========================================
-# 5. 실시간 텔레그램 렌더링 및 마감 처리
+# 6. 실시간 텔레그램 렌더링 및 마감 처리
 # ==========================================
 def build_message_text(status_header, answers_list):
-    """텔레그램 텍스트 생성"""
     lines = [status_header]
     if not answers_list:
         lines.append("⏳ <i>정답 수집 중... (제보 대기)</i>")
@@ -143,7 +212,6 @@ def build_message_text(status_header, answers_list):
     return "\n".join(lines)
 
 def finish_quiz_collection():
-    """5분 만료 시 수집 종료"""
     with quiz_state.lock:
         quiz_state.is_active = False
         msg_id = quiz_state.telegram_msg_id
@@ -154,7 +222,7 @@ def finish_quiz_collection():
     print("⏰ [타이머 마감] 5분 퀴즈 정답 수집이 마감되었습니다.")
 
 # ==========================================
-# 6. Socket.IO 이벤트 핸들러
+# 7. Socket.IO 이벤트 핸들러
 # ==========================================
 @sio.event
 def connect():
@@ -171,18 +239,11 @@ def on_new_message(data):
     content = clean_html(data.get("c") or data.get("rawContent") or "")
     time_str = format_time(data.get("t"))
     
-    # 터미널 실시간 출력
     print(f"💬 [{time_str}] {nick}: {content}")
 
-    # --------------------------------------------------
-    # 0. 감사/인사 메시지는 무조건 스킵 (트리거/수집 모두 제외)
-    # --------------------------------------------------
     if any(kw in content for kw in ["감사", "고맙"]):
         return
 
-    # --------------------------------------------------
-    # 1. 퀴즈 트리거 감지 (토퀴 / 토스 퀴즈 / 토스퀴즈)
-    # --------------------------------------------------
     is_quiz_trigger = any(kw in content for kw in ["토퀴", "토스 퀴즈", "토스퀴즈"])
     
     if is_quiz_trigger:
@@ -190,7 +251,6 @@ def on_new_message(data):
         now = time.time()
 
         with quiz_state.lock:
-            # 수집 중이 아닌 경우에만 새 트리거 메시지 발송 (진행 중 재트리거 금지)
             if not quiz_state.is_active:
                 if quiz_state.timer:
                     quiz_state.timer.cancel()
@@ -202,7 +262,6 @@ def on_new_message(data):
                 should_start = True
 
         if should_start:
-            # 최초 메시지에서도 정답이 추출되는지 확인 (예: "토스퀴즈   10" -> "10")
             initial_ans = extract_answer(content)
             if initial_ans:
                 quiz_state.answers.append(initial_ans)
@@ -214,16 +273,12 @@ def on_new_message(data):
                 quiz_state.telegram_msg_id = msg_id
                 quiz_state.last_sent_text = initial_text
                 
-                # 5분(300초) 타이머 시작
                 quiz_state.timer = threading.Timer(300.0, finish_quiz_collection)
                 quiz_state.timer.start()
                 
             print(f"🚨 [퀴즈 감지] 5분 정답 수집 시작 (Msg ID: {msg_id})")
-            return  # 트리거 세션 시작 후 해당 메시지 처리 완료
+            return
 
-    # --------------------------------------------------
-    # 2. 5분 동안 채팅창에 새 정답이 올라오면 기존 메시지 수정
-    # --------------------------------------------------
     with quiz_state.lock:
         is_active = quiz_state.is_active
         msg_id = quiz_state.telegram_msg_id
@@ -249,7 +304,7 @@ def catch_all(event_name, *args):
     pass
 
 # ==========================================
-# 7. 실행부
+# 8. 실행부
 # ==========================================
 headers = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/138.0.0.0",
@@ -258,6 +313,10 @@ headers = {
 
 if __name__ == "__main__":
     try:
+        # 텔레그램 메시지 감지 스레드 시작
+        tg_thread = threading.Thread(target=poll_telegram_messages, daemon=True)
+        tg_thread.start()
+
         sio.connect(
             "https://luckyquizchat.duckdns.org",
             socketio_path="socket.io",
