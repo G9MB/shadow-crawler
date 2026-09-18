@@ -5,8 +5,12 @@ import time
 import threading
 import requests
 import socketio
-from bs4 import BeautifulSoup
 from datetime import datetime
+
+# ==========================================
+# 0. HTTP 세션 생성 (커넥션 재사용으로 지연 단축)
+# ==========================================
+session = requests.Session()
 
 # ==========================================
 # 1. 설정 정보 (환경변수)
@@ -48,7 +52,7 @@ def send_telegram_msg(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
-        res = requests.post(url, json=payload, timeout=5).json()
+        res = session.post(url, json=payload, timeout=5).json()
         if res.get("ok"):
             return res["result"]["message_id"]
         else:
@@ -70,7 +74,7 @@ def edit_telegram_msg(msg_id, text):
         "parse_mode": "HTML"
     }
     try:
-        requests.post(url, json=payload, timeout=5)
+        session.post(url, json=payload, timeout=5)
     except Exception as e:
         print(f"⚠️ 텔레그램 수정 실패: {e}")
 
@@ -103,7 +107,7 @@ def poll_telegram_messages():
 
     # 시작 시 과거 오프라인 메시지 무시
     try:
-        res = requests.get(url, params={"timeout": 0, "offset": -1}, timeout=10).json()
+        res = session.get(url, params={"timeout": 0, "offset": -1}, timeout=10).json()
         if res.get("ok") and res.get("result"):
             last_update_id = res["result"][-1]["update_id"]
     except Exception:
@@ -112,7 +116,7 @@ def poll_telegram_messages():
     while True:
         try:
             params = {"timeout": 1, "offset": last_update_id + 1}
-            res = requests.get(url, params=params, timeout=3).json()
+            res = session.get(url, params=params, timeout=3).json()
 
             if res.get("ok") and res.get("result"):
                 for update in res["result"]:
@@ -146,7 +150,7 @@ def poll_telegram_messages():
         except Exception as e:
             time.sleep(3)
 
-        time.sleep(1)
+        time.sleep(0.5)
 
 # ==========================================
 # 5. 텍스트 정제 및 정답 검출 로직
@@ -154,7 +158,8 @@ def poll_telegram_messages():
 def clean_html(text):
     if not text:
         return ""
-    return BeautifulSoup(text, "html.parser").get_text().strip()
+    # 정규식을 이용한 고속 HTML 태그 제거
+    return re.sub(r'<[^>]+>', '', text).strip()
 
 def format_time(ts):
     if not ts:
