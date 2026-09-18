@@ -111,8 +111,8 @@ def poll_telegram_messages():
 
     while True:
         try:
-            params = {"timeout": 10, "offset": last_update_id + 1}
-            res = requests.get(url, params=params, timeout=15).json()
+            params = {"timeout": 1, "offset": last_update_id + 1}
+            res = requests.get(url, params=params, timeout=3).json()
 
             if res.get("ok") and res.get("result"):
                 for update in res["result"]:
